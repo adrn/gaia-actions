@@ -165,7 +165,7 @@ def main(pool, source_file, overwrite=False):
     t2 = Table(fits.getdata('/mnt/ceph/users/apricewhelan/data/gaia/APOGEE_preDR15_SH_release_Feb2019.fits'))
     t = join(t1, t2, keys='APOGEE_ID')
     t = t[t['SH_OUTPUTFLAGS'] == '']
-    g = GaiaData(source_file)
+    g = GaiaData(t)
 
     c = g.get_skycoord(distance=t['dist_50']*u.kpc,
                        radial_velocity=t['VHELIO_AVG']*u.km/u.s)
