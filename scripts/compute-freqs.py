@@ -167,7 +167,7 @@ def main(pool, source_file, overwrite=False):
     t = t[t['SH_OUTPUTFLAGS'] == '']
     g = GaiaData(t)
 
-    c = g.get_skycoord(distance=t['dist_50']*u.kpc,
+    c = g.get_skycoord(distance=t['dist50']*u.kpc,
                        radial_velocity=t['VHELIO_AVG']*u.km/u.s)
     galcen = c.transform_to(gc_frame)
     logger.debug('Data loaded...')
