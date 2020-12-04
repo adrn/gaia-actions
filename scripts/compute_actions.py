@@ -195,7 +195,7 @@ def main(pool, source_file, overwrite=False,
 
     logger.info(f"{len(todo_idx)} left to process")
 
-    tasks = batch_tasks(n_batches=max(1, pool.size - 1), arr=galcen,
+    tasks = batch_tasks(n_batches=16 * max(1, pool.size - 1), arr=galcen,
                         args=(meta, mw, cache_file, id_colname, ids))
     for r in pool.map(worker, tasks, callback=callback):
         pass
