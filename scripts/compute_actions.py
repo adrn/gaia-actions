@@ -205,6 +205,8 @@ def main(pool, source_file, overwrite=False,
 
 
 if __name__ == "__main__":
+    from threadpoolctl import threadpool_limits
+
     from argparse import ArgumentParser
     parser = ArgumentParser(description="")
 
@@ -244,5 +246,6 @@ if __name__ == "__main__":
     Pool = Pool
     Pool_kwargs = kw
 
-    with Pool(**Pool_kwargs) as pool:
-        main(pool, args.source_file, overwrite=args.overwrite)
+    with threadpool_limits(limits=1, user_api='blas'):
+        with Pool(**Pool_kwargs) as pool:
+            main(pool, args.source_file, overwrite=args.overwrite)
