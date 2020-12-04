@@ -82,8 +82,8 @@ def worker(task):
 
         # Lz and E
         try:
-            all_data['L'][n] = np.squeeze(
-                orbit.angular_momentum().to_value(meta['L']['unit']))
+            all_data['L'][n] = np.mean(
+                orbit.angular_momentum().to_value(meta['L']['unit']), axis=1)
             all_data['E'][n] = np.mean(
                 orbit.energy().to_value(meta['E']['unit']))
         except Exception as e:
@@ -110,7 +110,7 @@ def main(pool, source_file, overwrite=False,
     cache_path.mkdir(exist_ok=True)
 
     source_file = pathlib.Path(source_file).resolve()
-    cache_file = cache_path / f"{source_file.name.split('.')[0]}.fits"
+    cache_file = cache_path / f"{source_file.name.split('.')[0]}.hdf5"
     logger.debug(f'Writing to cache file {cache_file}'.format(cache_file))
 
     # Global parameters

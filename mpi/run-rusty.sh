@@ -1,19 +1,19 @@
 #!/bin/bash
-#SBATCH -J actions          # job name
-#SBATCH -o actions.o%j             # output file name (%j expands to jobID)
-#SBATCH -e actions.e%j             # error file name (%j expands to jobID)
-#SBATCH -N 4
-#SBATCH -t 24:00:00             # run time (hh:mm:ss) - 1.5 hours
+#SBATCH -J actions
+#SBATCH -o logs/actions.o%j
+#SBATCH -e logs/actions.e%j
+#SBATCH -N 10
+#SBATCH -t 48:00:00
 #SBATCH -p cca
 
 source ~/.bash_profile
 
-cd /mnt/ceph/users/apricewhelan/projects/dr2-actions/scripts
+cd /mnt/ceph/users/apricewhelan/projects/gaia-actions/scripts
 
-module load gcc openmpi2
+init_conda
 
 date
 
-srun python compute-freqs.py -v -f derp --mpi
+mpiexec python compute_actions.py -v -f ~/data/GaiaEDR3/edr3-rv-good-plx-result.fits.gz --mpi
 
 date
