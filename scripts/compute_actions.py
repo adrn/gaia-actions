@@ -129,7 +129,6 @@ def main(pool, source_file, overwrite=False,
 
     # Load the source data table:
     g = GaiaData(at.QTable.read(source_file))
-    g = g[:5]
 
     mask = np.ones(len(g), dtype=bool)
     if id_colname is None:  # assumes gaia

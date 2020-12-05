@@ -2,9 +2,10 @@
 #SBATCH -J actions
 #SBATCH -o logs/actions.o%j
 #SBATCH -e logs/actions.e%j
-#SBATCH -N 10
-#SBATCH -t 48:00:00
+#SBATCH -N 8
+#SBATCH -t 24:00:00
 #SBATCH -p cca
+#SBATCH --constraint=skylake
 
 source ~/.bash_profile
 
@@ -14,6 +15,6 @@ init_conda
 
 date
 
-mpirun python compute_actions.py -v -f ~/data/GaiaEDR3/edr3-rv-good-plx-result.fits.gz --mpi
+mpirun python compute_actions.py -v -f ~/data/GaiaEDR3/edr3-rv-good-plx-result.fits.gz --mpi -o
 
 date
