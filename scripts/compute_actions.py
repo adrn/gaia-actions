@@ -28,8 +28,9 @@ Nmax = 8  # for find_actions
 
 
 def worker(task):
-    (i, j), galcen, meta, pot, cache_file, id_colname, ids = task
-    ids = ids[i:j]
+    (i, j), idx, galcen, meta, pot, cache_file, id_colname, ids = task
+    ids = ids[idx]
+    galcen = galcen[idx]
 
     w0 = gd.PhaseSpacePosition(galcen.cartesian)
     H = gp.Hamiltonian(pot)
@@ -73,12 +74,16 @@ def worker(task):
 
         # Other various things:
         try:
+            rper = orbit.pericenter(approximate=True).to_value(
+                meta['r_per']['unit'])
+            rapo = orbit.apocenter(approximate=True).to_value(
+                meta['r_apo']['unit'])
+
             all_data['z_max'][n] = orbit.zmax(approximate=True).to_value(
                 meta['z_max']['unit'])
-            all_data['r_per'][n] = orbit.pericenter(approximate=True).to_value(
-                meta['r_per']['unit'])
-            all_data['r_apo'][n] = orbit.apocenter(approximate=True).to_value(
-                meta['r_apo']['unit'])
+            all_data['r_per'][n] = rper
+            all_data['r_apo'][n] = rapo
+            all_data['ecc'][n] = (rapo - rper) / (rapo + rper)
         except Exception as e:
             logger.error(f'Failed to compute zmax peri apo for orbit {i}\n{e}')
 
@@ -91,15 +96,15 @@ def worker(task):
         except Exception as e:
             logger.error(f'Failed to compute E Lz for orbit {i}\n{e}')
 
-    return (i, j), cache_file, all_data
+    return idx, cache_file, all_data
 
 
 def callback(res):
-    (i, j), cache_file, all_data = res
+    idx, cache_file, all_data = res
 
     with h5py.File(cache_file, 'r+') as f:
         for k in all_data:
-            f[k][i:j] = all_data[k]
+            f[k][idx] = all_data[k]
 
 
 def main(pool, source_file, overwrite=False,
@@ -175,6 +180,7 @@ def main(pool, source_file, overwrite=False,
         'z_max': {'shape': (Nstars, ), 'unit': u.kpc},
         'r_per': {'shape': (Nstars, ), 'unit': u.kpc},
         'r_apo': {'shape': (Nstars, ), 'unit': u.kpc},
+        'ecc': {'shape': (Nstars, ), 'unit': u.one},
         'L': {'shape': (Nstars, 3), 'unit': u.kpc * u.km/u.s},
         'E': {'shape': (Nstars, ), 'unit': (u.km/u.s)**2},
     }
@@ -192,13 +198,13 @@ def main(pool, source_file, overwrite=False,
     # If path exists, see what indices are not already done
     with h5py.File(cache_file, 'r') as f:
         i1 = np.all(np.isnan(f['freqs'][:]), axis=1)
-        i2 = np.isnan(f['z_max'][:])
+        i2 = np.isnan(f['ecc'][:])
         todo_idx = np.where(i1 & i2)[0]
 
     logger.info(f"{len(todo_idx)} left to process")
 
-    tasks = batch_tasks(n_batches=16 * max(1, pool.size - 1), arr=galcen,
-                        args=(meta, mw, cache_file, id_colname, ids))
+    tasks = batch_tasks(n_batches=16 * max(1, pool.size - 1), arr=todo_idx,
+                        args=(galcen, meta, mw, cache_file, id_colname, ids))
     for r in pool.map(worker, tasks, callback=callback):
         pass
 
