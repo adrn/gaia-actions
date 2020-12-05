@@ -14,6 +14,6 @@ init_conda
 
 date
 
-mpiexec python compute_actions.py -v -f ~/data/GaiaEDR3/edr3-rv-good-plx-result.fits.gz --mpi
+mpirun python compute_actions.py -v -f ~/data/GaiaEDR3/edr3-rv-good-plx-result.fits.gz --mpi
 
 date
