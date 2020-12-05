@@ -43,7 +43,8 @@ def worker(task):
         if k == id_colname:
             all_data[k] = ids
         else:
-            all_data[k] = np.full(info['shape'], np.nan)
+            shape = (len(ids), ) + info['shape'][1:]
+            all_data[k] = np.full(shape, np.nan)
 
     for n in range(len(galcen)):
         all_data[id_colname][n] = ids[n]
@@ -102,6 +103,7 @@ def worker(task):
 def callback(res):
     idx, cache_file, all_data = res
 
+    logger.debug(f'Writing block {idx[0]}-{idx[-1]} to cache file')
     with h5py.File(cache_file, 'r+') as f:
         for k in all_data:
             f[k][idx] = all_data[k]
@@ -127,6 +129,7 @@ def main(pool, source_file, overwrite=False,
 
     # Load the source data table:
     g = GaiaData(at.QTable.read(source_file))
+    g = g[:5]
 
     mask = np.ones(len(g), dtype=bool)
     if id_colname is None:  # assumes gaia
@@ -186,7 +189,7 @@ def main(pool, source_file, overwrite=False,
     }
 
     # Make sure output file exists
-    if not cache_file.exists():
+    if not cache_file.exists() or overwrite:
         with h5py.File(cache_file, 'w') as f:
             for name, info in meta.items():
                 d = f.create_dataset(name, shape=info['shape'],
@@ -203,7 +206,8 @@ def main(pool, source_file, overwrite=False,
 
     logger.info(f"{len(todo_idx)} left to process")
 
-    tasks = batch_tasks(n_batches=16 * max(1, pool.size - 1), arr=todo_idx,
+    n_batches = min(16 * max(1, pool.size - 1), len(todo_idx))
+    tasks = batch_tasks(n_batches=n_batches, arr=todo_idx,
                         args=(galcen, meta, mw, cache_file, id_colname, ids))
     for r in pool.map(worker, tasks, callback=callback):
         pass
