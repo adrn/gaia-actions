@@ -235,6 +235,10 @@ if __name__ == "__main__":
     parser.add_argument("-v", dest="verbose", default=False,
                         action="store_true", help="Verbose mode.")
 
+    parser.add_argument("--id-col", dest="id_colname", default=None)
+    parser.add_argument("--dist-col", dest="dist_colname", default=None)
+    parser.add_argument("--rv-col", dest="rv_colname", default=None)
+
     args = parser.parse_args()
 
     if args.verbose:
@@ -260,4 +264,6 @@ if __name__ == "__main__":
 
     with threadpool_limits(limits=1, user_api='blas'):
         with Pool(**Pool_kwargs) as pool:
-            main(pool, args.source_file, overwrite=args.overwrite)
+            main(pool, args.source_file, overwrite=args.overwrite,
+                 id_colname=args.id_colname, dist_colname=args.dist_colname,
+                 rv_colname=args.rv_colname)
