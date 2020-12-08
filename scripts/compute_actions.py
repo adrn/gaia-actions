@@ -154,20 +154,20 @@ def main(pool, source_file, overwrite=False,
     else:
         rv = g.data[rv_colname]
 
-    if not hasattr(dist, 'unit') or dist.unit == u.one:
+    if not hasattr(dist, 'unit') or dist.unit == u.one or dist.unit is None:
         logger.warning("No distance unit specified in table - assuming kpc")
         dist = dist * u.kpc
-
-    if not hasattr(rv, 'unit') or rv.unit == u.one:
+    
+    if not hasattr(rv, 'unit') or rv.unit == u.one or rv.unit is None:
         logger.warning("No RV unit specified in table - assuming km/s")
         rv = rv * u.km/u.s
 
     # Get coordinates, and only keep good values:
     if ~np.all(mask):
         logger.warning(f"Filtering {mask.sum()} bad distance or RV values")
-
-    c = g[mask].get_skycoord(distance=dist[mask],
-                             radial_velocity=rv[mask])
+    
+    c = g[mask].get_skycoord(distance=u.Quantity(dist[mask]),
+                             radial_velocity=u.Quantity(rv[mask]))
     ids = ids[mask]
 
     galcen = c.transform_to(gc_frame)
