@@ -142,6 +142,7 @@ def main(pool, source_file, overwrite=False,
         mask &= np.isfinite(dist)
     else:
         dist = g.data[dist_colname]
+    mask &= dist > 0
 
     if rv_colname is None:  # assumes gaia
         if hasattr(g, 'radial_velocity'):
