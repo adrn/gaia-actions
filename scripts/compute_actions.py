@@ -200,7 +200,7 @@ def main(pool, source_file, overwrite=False,
         'xyz': {'shape': (Nstars, 3), 'unit': u.kpc},
         'vxyz': {'shape': (Nstars, 3), 'unit': u.km/u.s},
         # Frequencies, actions, and angles computed with Sanders & Binney
-        'freqs': {'shape': (Nstars, 3), 'unit': 1/u.Gyr},
+        'freqs': {'shape': (Nstars, 3), 'unit': u.rad / u.Gyr},
         'actions': {'shape': (Nstars, 3), 'unit': u.kpc * u.km/u.s},
         'angles': {'shape': (Nstars, 3), 'unit': u.rad},
         # Orbit parameters:
