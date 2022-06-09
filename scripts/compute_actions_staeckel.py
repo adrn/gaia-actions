@@ -56,8 +56,9 @@ def worker(task):
             aaf = find_actions_staeckel(pot, w0[n])
         except Exception as e:
             logger.error(f"Failed to pre-compute actions {i}\n{str(e)}")
+            continue
 
-        T = (2 * np.pi * u.rad / aaf["freqs"][0]).to(u.Gyr)
+        T = (2 * np.pi / aaf["freqs"][0]).to(u.Gyr)
         try:
             orbit = pot.integrate_orbit(
                 w0[n],
@@ -148,14 +149,14 @@ def main(
         gc_frame = coord.Galactocentric()
 
     if potential_filename is not None:
-        potential_filename = pathlib.Path(potential_filename)
+        potential_filename = pathlib.Path(potential_filename).resolve().absolute()
         mw = gp.load(potential_filename)
         potential_name = potential_filename.name.split('.')[0]
     else:
         mw = gp.MilkyWayPotential()
         potential_name = 'MilkyWayPotential'
 
-    cache_file = cache_path / f"{source_file.name.split('.')[0]}_{potential_name}.hdf5"
+    cache_file = cache_path / f"{source_file.name.split('.')[0]}-{potential_name}.hdf5"
     logger.debug(f"Writing to cache file {cache_file}".format(cache_file))
 
     # Load the source data table:
@@ -174,6 +175,8 @@ def main(
     else:
         dist = g.data[dist_colname]
 
+    mask &= dist > 0
+
     if rv_colname is None:  # assumes gaia
         if hasattr(g, "radial_velocity"):
             rv = g.radial_velocity
@@ -185,11 +188,11 @@ def main(
     else:
         rv = g.data[rv_colname]
 
-    if not hasattr(dist, "unit") or dist.unit == u.one:
+    if not hasattr(dist, "unit") or dist.unit == u.one or dist.unit is None:
         logger.warning("No distance unit specified in table - assuming kpc")
         dist = dist * u.kpc
 
-    if not hasattr(rv, "unit") or rv.unit == u.one:
+    if not hasattr(rv, "unit") or rv.unit == u.one or rv.unit is None:
         logger.warning("No RV unit specified in table - assuming km/s")
         rv = rv * u.km / u.s
 
@@ -197,7 +200,10 @@ def main(
     if ~np.all(mask):
         logger.warning(f"Filtering {mask.sum()} bad distance or RV values")
 
-    c = g[mask].get_skycoord(distance=dist[mask], radial_velocity=rv[mask])
+    c = g[mask].get_skycoord(
+        distance=u.Quantity(dist[mask]),
+        radial_velocity=u.Quantity(rv[mask])
+    )
     ids = ids[mask]
 
     galcen = c.transform_to(gc_frame)
@@ -215,7 +221,7 @@ def main(
         "xyz": {"shape": (Nstars, 3), "unit": u.kpc},
         "vxyz": {"shape": (Nstars, 3), "unit": u.km / u.s},
         # Frequencies, actions, and angles computed with Sanders & Binney
-        "freqs": {"shape": (Nstars, 3), "unit": 1 / u.Gyr},
+        "freqs": {"shape": (Nstars, 3), "unit": u.rad / u.Gyr},
         "actions": {"shape": (Nstars, 3), "unit": u.kpc * u.km / u.s},
         "angles": {"shape": (Nstars, 3), "unit": u.rad},
         # Orbit parameters:
