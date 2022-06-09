@@ -133,7 +133,7 @@ def main(pool, source_file, overwrite=False,
     mask = np.ones(len(g), dtype=bool)
     if id_colname is None:  # assumes gaia
         id_colname = 'source_id'
-        ids = g.source_id
+        ids = g.source_id.astype('i8')
     else:
         ids = g.data[id_colname]
 
