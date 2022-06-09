@@ -3,6 +3,7 @@ import os
 os.environ["OMP_NUM_THREADS"] = "1"
 import logging
 import pathlib
+import pickle
 import sys
 
 # Third-party
@@ -28,12 +29,13 @@ Nmax = 8  # for find_actions
 
 
 def worker(task):
-    (i, j), idx, galcen, meta, pot, cache_file, id_colname, ids = task
+    (i, j), idx, galcen, meta, potential, frame, cache_file, id_colname, ids = task
     ids = ids[idx]
     galcen = galcen[idx]
 
     w0 = gd.PhaseSpacePosition(galcen.cartesian)
-    H = gp.Hamiltonian(pot)
+    H = gp.Hamiltonian(potential, frame)
+    static_frame = gp.StaticFrame(H.units)
 
     logger.debug(f"Worker {i}-{j}: running {j-i} tasks now")
 
@@ -57,6 +59,7 @@ def worker(task):
             orbit = H.integrate_orbit(w0[n], dt=0.5*u.Myr, t1=0*u.Myr,
                                       t2=integrate_time,
                                       Integrator=gi.DOPRI853Integrator)
+            orbit = orbit.to_frame(static_frame)
         except Exception as e:
             logger.error(f'Failed to integrate orbit {i}\n{str(e)}')
             continue
@@ -110,7 +113,8 @@ def callback(res):
 
 
 def main(pool, source_file, overwrite=False,
-         id_colname=None, dist_colname=None, rv_colname=None):
+         id_colname=None, dist_colname=None, rv_colname=None,
+         potential_filename=None):
 
     logger.debug(f'Starting file {source_file}...')
 
@@ -119,13 +123,25 @@ def main(pool, source_file, overwrite=False,
     cache_path.mkdir(exist_ok=True)
 
     source_file = pathlib.Path(source_file).resolve()
-    cache_file = cache_path / f"{source_file.name.split('.')[0]}.hdf5"
-    logger.debug(f'Writing to cache file {cache_file}'.format(cache_file))
 
     # Global parameters
     with coord.galactocentric_frame_defaults.set('v4.0'):
         gc_frame = coord.Galactocentric()
-    mw = gp.MilkyWayPotential()
+        
+    if potential_filename is None:
+        mw = gp.MilkyWayPotential()
+        H = gp.Hamiltonian(mw)
+        potential_name = 'MilkyWayPotential'
+    elif potential_filename.suffix in ['.pickle', '.pkl']:
+        with open(potential_filename, 'rb') as f:
+            H = pickle.load(f)
+        potential_name = potential_filename.parts[-1].split('.')[0]
+    else:
+        print("/unknown potential file type")
+        return
+    
+    cache_file = cache_path / f"{source_file.name.split('.')[0]}-{potential_name}.hdf5"
+    logger.debug(f'Writing to cache file {cache_file}'.format(cache_file))
 
     # Load the source data table:
     g = GaiaData(at.QTable.read(source_file))
@@ -142,6 +158,7 @@ def main(pool, source_file, overwrite=False,
         mask &= np.isfinite(dist)
     else:
         dist = g.data[dist_colname]
+    mask &= dist > 0
 
     if rv_colname is None:  # assumes gaia
         if hasattr(g, 'radial_velocity'):
@@ -154,20 +171,20 @@ def main(pool, source_file, overwrite=False,
     else:
         rv = g.data[rv_colname]
 
-    if not hasattr(dist, 'unit') or dist.unit == u.one:
+    if not hasattr(dist, 'unit') or dist.unit == u.one or dist.unit is None:
         logger.warning("No distance unit specified in table - assuming kpc")
         dist = dist * u.kpc
-
-    if not hasattr(rv, 'unit') or rv.unit == u.one:
+    
+    if not hasattr(rv, 'unit') or rv.unit == u.one or rv.unit is None:
         logger.warning("No RV unit specified in table - assuming km/s")
         rv = rv * u.km/u.s
 
     # Get coordinates, and only keep good values:
     if ~np.all(mask):
         logger.warning(f"Filtering {mask.sum()} bad distance or RV values")
-
-    c = g[mask].get_skycoord(distance=dist[mask],
-                             radial_velocity=rv[mask])
+    
+    c = g[mask].get_skycoord(distance=u.Quantity(dist[mask]),
+                             radial_velocity=u.Quantity(rv[mask]))
     ids = ids[mask]
 
     galcen = c.transform_to(gc_frame)
@@ -183,7 +200,7 @@ def main(pool, source_file, overwrite=False,
         'xyz': {'shape': (Nstars, 3), 'unit': u.kpc},
         'vxyz': {'shape': (Nstars, 3), 'unit': u.km/u.s},
         # Frequencies, actions, and angles computed with Sanders & Binney
-        'freqs': {'shape': (Nstars, 3), 'unit': 1/u.Gyr},
+        'freqs': {'shape': (Nstars, 3), 'unit': u.rad / u.Gyr},
         'actions': {'shape': (Nstars, 3), 'unit': u.kpc * u.km/u.s},
         'angles': {'shape': (Nstars, 3), 'unit': u.rad},
         # Orbit parameters:
@@ -215,7 +232,7 @@ def main(pool, source_file, overwrite=False,
 
     n_batches = min(16 * max(1, pool.size - 1), len(todo_idx))
     tasks = batch_tasks(n_batches=n_batches, arr=todo_idx,
-                        args=(galcen, meta, mw, cache_file, id_colname, ids))
+                        args=(galcen, meta, H.potential, H.frame, cache_file, id_colname, ids))
     for r in pool.map(worker, tasks, callback=callback):
         pass
 
@@ -245,6 +262,9 @@ if __name__ == "__main__":
     parser.add_argument("--id-col", dest="id_colname", default=None)
     parser.add_argument("--dist-col", dest="dist_colname", default=None)
     parser.add_argument("--rv-col", dest="rv_colname", default=None)
+    
+    parser.add_argument("-p", "--potential", dest="potential_filename", 
+                        default=None)
 
     args = parser.parse_args()
 
@@ -273,4 +293,5 @@ if __name__ == "__main__":
         with Pool(**Pool_kwargs) as pool:
             main(pool, args.source_file, overwrite=args.overwrite,
                  id_colname=args.id_colname, dist_colname=args.dist_colname,
-                 rv_colname=args.rv_colname)
+                 rv_colname=args.rv_colname,
+                 potential_filename=pathlib.Path(args.potential_filename))
