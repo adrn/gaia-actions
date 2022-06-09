@@ -53,12 +53,12 @@ def worker(task):
         )
 
         try:
-            aaf = find_actions_staeckel(pot, w0[n])
+            aaf = find_actions_staeckel(pot, w0[n])[0]
         except Exception as e:
             logger.error(f"Failed to pre-compute actions {i}\n{str(e)}")
             continue
 
-        T = (2 * np.pi / aaf["freqs"][0]).to(u.Gyr)
+        T = np.abs(2 * np.pi / aaf["freqs"].min()).to(u.Gyr)
         try:
             orbit = pot.integrate_orbit(
                 w0[n],
@@ -81,7 +81,7 @@ def worker(task):
             all_data["angles"][n] = res["angles"].to_value(
                 meta["angles"]["unit"]
             )
-            all_data["freqs"][n] = res["freqs"].to_value(meta["freqs"]["unit"])
+            all_data["freqs"][n] = res["freqs"].to_value(meta["freqs"]["unit"], u.dimensionless_angles())
         except Exception as e:
             logger.error(f"Failed to compute mean actions {i}\n{str(e)}")
 
