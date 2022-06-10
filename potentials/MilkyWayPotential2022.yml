@@ -20,7 +20,7 @@ components:
     h_R_unit: kpc
     h_z: 0.3
     h_z_unit: kpc
-    m: 35000000000.0
+    m: 47716664286.85036
     m_unit: solMass
   units:
     angle: rad
@@ -31,9 +31,9 @@ components:
 - class: HernquistPotential
   name: nucl
   parameters:
-    c: 0.040980931599352614
+    c: 0.06888673680006865
     c_unit: kpc
-    m: 1145571253.6180775
+    m: 1814194851.5541859
     m_unit: solMass
   units:
     angle: rad
@@ -50,9 +50,9 @@ components:
     b_unit: ''
     c: 1.0
     c_unit: ''
-    m: 431030508214.5751
+    m: 554271110519.767
     m_unit: solMass
-    r_s: 10.831634416323576
+    r_s: 15.625903558190732
     r_s_unit: kpc
   units:
     angle: rad
