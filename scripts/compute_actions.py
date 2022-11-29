@@ -118,11 +118,23 @@ def worker_o2gf(task):
 
 
 def worker_staeckel(task):
-    (i, j), idx, galcen, meta, pot, cache_file, id_colname, ids = task
+    (
+        (i, j),
+        idx,
+        galcen,
+        meta,
+        potential,
+        frame,
+        cache_file,
+        id_colname,
+        ids,
+    ) = task
     ids = ids[idx]
     galcen = galcen[idx]
 
     w0 = gd.PhaseSpacePosition(galcen.cartesian)
+    H = gp.Hamiltonian(potential, frame)
+    static_frame = gp.StaticFrame(H.units)
 
     logger.debug(f"Worker {i}-{j}: running {j-i} tasks now")
 
@@ -141,27 +153,28 @@ def worker_staeckel(task):
         all_data["vxyz"][n] = galcen.velocity.d_xyz[:, n].to_value(meta["vxyz"]["unit"])
 
         try:
-            aaf = find_actions_staeckel(pot, w0[n])[0]
+            aaf = find_actions_staeckel(H.potential, w0[n])[0]
         except Exception as e:
             logger.error(f"Failed to pre-compute actions {i}\n{str(e)}")
             continue
 
         T = 4 * np.abs(2 * np.pi / aaf["freqs"].min()).to(u.Gyr)
         try:
-            orbit = pot.integrate_orbit(
+            orbit = H.integrate_orbit(
                 w0[n],
                 dt=0.5 * u.Myr,
                 t1=0 * u.Myr,
                 t2=T,
                 Integrator=gi.DOPRI853Integrator,
             )
+            orbit = orbit.to_frame(static_frame)
         except Exception as e:
             logger.error(f"Failed to integrate orbit {i}\n{str(e)}")
             continue
 
         # Compute actions / frequencies / angles
         try:
-            res = find_actions_staeckel(pot, orbit)[0]
+            res = find_actions_staeckel(H.potential, orbit)[0]
 
             all_data["actions"][n] = res["actions"].to_value(meta["actions"]["unit"])
             all_data["angles"][n] = res["angles"].to_value(meta["angles"]["unit"])
@@ -227,8 +240,6 @@ def main(
     source_file = pathlib.Path(source_file).resolve()
 
     # Global parameters
-    with coord.galactocentric_frame_defaults.set("v4.0"):
-        gc_frame = coord.Galactocentric()
 
     if potential_filename is None:
         mw = gp.MilkyWayPotential()
