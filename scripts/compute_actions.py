@@ -65,9 +65,7 @@ def worker_o2gf(task):
     for n in range(len(galcen)):
         all_data[id_colname][n] = ids[n]
         all_data["xyz"][n] = galcen.data.xyz[:, n].to_value(meta["xyz"]["unit"])
-        all_data["vxyz"][n] = galcen.velocity.d_xyz[:, n].to_value(
-            meta["vxyz"]["unit"]
-        )
+        all_data["vxyz"][n] = galcen.velocity.d_xyz[:, n].to_value(meta["vxyz"]["unit"])
 
         try:
             orbit = H.integrate_orbit(
@@ -85,24 +83,16 @@ def worker_o2gf(task):
         # Compute actions / frequencies / angles
         try:
             res = gd.find_actions(orbit, N_max=Nmax)
-            all_data["actions"][n] = res["actions"].to_value(
-                meta["actions"]["unit"]
-            )
-            all_data["angles"][n] = res["angles"].to_value(
-                meta["angles"]["unit"]
-            )
+            all_data["actions"][n] = res["actions"].to_value(meta["actions"]["unit"])
+            all_data["angles"][n] = res["angles"].to_value(meta["angles"]["unit"])
             all_data["freqs"][n] = res["freqs"].to_value(meta["freqs"]["unit"])
         except Exception as e:
             logger.error(f"Failed to run find actions for orbit {i}\n{str(e)}")
 
         # Other various things:
         try:
-            rper = orbit.pericenter(approximate=True).to_value(
-                meta["r_per"]["unit"]
-            )
-            rapo = orbit.apocenter(approximate=True).to_value(
-                meta["r_apo"]["unit"]
-            )
+            rper = orbit.pericenter(approximate=True).to_value(meta["r_per"]["unit"])
+            rapo = orbit.apocenter(approximate=True).to_value(meta["r_apo"]["unit"])
 
             all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
                 meta["z_max"]["unit"]
@@ -118,9 +108,7 @@ def worker_o2gf(task):
             all_data["L"][n] = np.mean(
                 orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
             )
-            all_data["E"][n] = np.mean(
-                orbit.energy().to_value(meta["E"]["unit"])
-            )
+            all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
         except Exception as e:
             logger.error(f"Failed to compute E Lz for orbit {i}\n{e}")
 
@@ -148,9 +136,7 @@ def worker_staeckel(task):
     for n in range(len(galcen)):
         all_data[id_colname][n] = ids[n]
         all_data["xyz"][n] = galcen.data.xyz[:, n].to_value(meta["xyz"]["unit"])
-        all_data["vxyz"][n] = galcen.velocity.d_xyz[:, n].to_value(
-            meta["vxyz"]["unit"]
-        )
+        all_data["vxyz"][n] = galcen.velocity.d_xyz[:, n].to_value(meta["vxyz"]["unit"])
 
         try:
             aaf = find_actions_staeckel(pot, w0[n])[0]
@@ -175,24 +161,18 @@ def worker_staeckel(task):
         try:
             res = find_actions_staeckel(pot, orbit)[0]
 
-            all_data["actions"][n] = res["actions"].to_value(
-                meta["actions"]["unit"]
+            all_data["actions"][n] = res["actions"].to_value(meta["actions"]["unit"])
+            all_data["angles"][n] = res["angles"].to_value(meta["angles"]["unit"])
+            all_data["freqs"][n] = res["freqs"].to_value(
+                meta["freqs"]["unit"], u.dimensionless_angles()
             )
-            all_data["angles"][n] = res["angles"].to_value(
-                meta["angles"]["unit"]
-            )
-            all_data["freqs"][n] = res["freqs"].to_value(meta["freqs"]["unit"], u.dimensionless_angles())
         except Exception as e:
             logger.error(f"Failed to compute mean actions {i}\n{str(e)}")
 
         # Other various things:
         try:
-            rper = orbit.pericenter(approximate=True).to_value(
-                meta["r_per"]["unit"]
-            )
-            rapo = orbit.apocenter(approximate=True).to_value(
-                meta["r_apo"]["unit"]
-            )
+            rper = orbit.pericenter(approximate=True).to_value(meta["r_per"]["unit"])
+            rapo = orbit.apocenter(approximate=True).to_value(meta["r_apo"]["unit"])
 
             all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
                 meta["z_max"]["unit"]
@@ -208,9 +188,7 @@ def worker_staeckel(task):
             all_data["L"][n] = np.mean(
                 orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
             )
-            all_data["E"][n] = np.mean(
-                orbit.energy().to_value(meta["E"]["unit"])
-            )
+            all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
         except Exception as e:
             logger.error(f"Failed to compute E Lz for orbit {i}\n{e}")
 
@@ -260,14 +238,13 @@ def main(
         potential_name = potential_filename.parts[-1].split(".")[0]
     elif potential_filename.suffix in [".yml", ".yaml"]:
         mw = gp.load(potential_filename)
-        potential_name = potential_filename.name.split('.')[0]
+        potential_name = potential_filename.name.split(".")[0]
     else:
         raise ValueError("Unknown potential file type")
 
     if galcen_filename is None:
         gc_frame = coord.Galactocentric(
-            galcen_distance=8.275 * u.kpc,
-            galcen_v_sun=[8.4, 251.8, 8.4] * u.km/u.s
+            galcen_distance=8.275 * u.kpc, galcen_v_sun=[8.4, 251.8, 8.4] * u.km / u.s
         )
     else:
         with open(galcen_filename, "rb") as f:
@@ -275,15 +252,13 @@ def main(
 
     if use_staeckel:
         worker = worker_staeckel
-        act_name = 'staeckel'
+        act_name = "staeckel"
     else:
         worker = worker_o2gf
-        act_name = 'o2gf'
+        act_name = "o2gf"
 
-    source_name = source_file.name.split('.')[0]
-    cache_file = (
-        cache_path / f"{source_name}-{potential_name}-{act_name}.hdf5"
-    )
+    source_name = source_file.name.split(".")[0]
+    cache_file = cache_path / f"{source_name}-{potential_name}-{act_name}.hdf5"
     logger.debug(f"Writing to cache file {cache_file}".format(cache_file))
 
     galcen_cache_file = (
@@ -448,13 +423,9 @@ if __name__ == "__main__":
     parser.add_argument("--dist-col", dest="dist_colname", default=None)
     parser.add_argument("--rv-col", dest="rv_colname", default=None)
 
-    parser.add_argument(
-        "-p", "--potential", dest="potential_filename", default=None
-    )
+    parser.add_argument("-p", "--potential", dest="potential_filename", default=None)
 
-    parser.add_argument(
-        "-g", "--galcen", dest="galcen_filename", default=None
-    )
+    parser.add_argument("-g", "--galcen", dest="galcen_filename", default=None)
 
     args = parser.parse_args()
 
@@ -493,5 +464,5 @@ if __name__ == "__main__":
                 rv_colname=args.rv_colname,
                 potential_filename=pathlib.Path(args.potential_filename),
                 galcen_filename=args.galcen_filename,
-                use_staeckel=args.use_staeckel
+                use_staeckel=args.use_staeckel,
             )
