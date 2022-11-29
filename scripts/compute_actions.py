@@ -89,11 +89,22 @@ def worker_o2gf(task):
         except Exception as e:
             logger.error(f"Failed to run find actions for orbit {i}\n{str(e)}")
 
+        # Lz and E
+        try:
+            L = orbit.angular_momentum().to_value(meta["L"]["unit"])
+            all_data["L"][n] = np.mean(L, axis=1)
+            all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
+        except Exception as e:
+            logger.error(f"Failed to compute E Lz for orbit {i}\n{e}")
+            L = np.full(orbit.xyz.shape, np.nan)
+
         # Other various things:
         try:
             rper = orbit.pericenter(approximate=True).to_value(meta["r_per"]["unit"])
             rapo = orbit.apocenter(approximate=True).to_value(meta["r_apo"]["unit"])
 
+            vcirc = potential.circular_velocity(orbit.xyz)
+            all_data["R_guide"][n] = np.mean(L[:, 2] / vcirc)
             all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
                 meta["z_max"]["unit"]
             )
@@ -102,15 +113,6 @@ def worker_o2gf(task):
             all_data["ecc"][n] = (rapo - rper) / (rapo + rper)
         except Exception as e:
             logger.error(f"Failed to compute zmax peri apo for orbit {i}\n{e}")
-
-        # Lz and E
-        try:
-            all_data["L"][n] = np.mean(
-                orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
-            )
-            all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
-        except Exception as e:
-            logger.error(f"Failed to compute E Lz for orbit {i}\n{e}")
 
     return idx, cache_file, all_data
 
@@ -230,7 +232,6 @@ def main(
 
     if potential_filename is None:
         mw = gp.MilkyWayPotential()
-        H = gp.Hamiltonian(mw)
         potential_name = "MilkyWayPotential"
     elif potential_filename.suffix in [".pickle", ".pkl"]:
         with open(potential_filename, "rb") as f:
@@ -241,6 +242,8 @@ def main(
         potential_name = potential_filename.name.split(".")[0]
     else:
         raise ValueError("Unknown potential file type")
+
+    H = gp.Hamiltonian(mw)
 
     if galcen_filename is None:
         gc_frame = coord.Galactocentric(
@@ -264,6 +267,8 @@ def main(
     galcen_cache_file = (
         cache_path / f"{source_name}-{potential_name}-{act_name}.galcen.pkl"
     )
+    with open(galcen_cache_file, 'wb') as f:
+        pickle.dump(gc_frame, f)
 
     # Load the source data table:
     g = GaiaData(at.QTable.read(source_file))
