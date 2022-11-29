@@ -22,15 +22,17 @@ import gala.dynamics as gd
 import gala.integrate as gi
 import gala.potential as gp
 from schwimmbad.utils import batch_tasks
+from staeckel_helper import find_actions_staeckel
 
 logger = logging.getLogger(__name__)
 logging.basicConfig()
 
+# Used in worker_o2gf
 integrate_time = 25.0 * u.Gyr  # HACK: hardcoded! ~100 orbital periods
 Nmax = 8  # for find_actions
 
 
-def worker(task):
+def worker_o2gf(task):
     (
         (i, j),
         idx,
@@ -125,6 +127,96 @@ def worker(task):
     return idx, cache_file, all_data
 
 
+def worker_staeckel(task):
+    (i, j), idx, galcen, meta, pot, cache_file, id_colname, ids = task
+    ids = ids[idx]
+    galcen = galcen[idx]
+
+    w0 = gd.PhaseSpacePosition(galcen.cartesian)
+
+    logger.debug(f"Worker {i}-{j}: running {j-i} tasks now")
+
+    # Set up data containers:
+    all_data = {}
+    for k, info in meta.items():
+        if k == id_colname:
+            all_data[k] = ids
+        else:
+            shape = (len(ids),) + info["shape"][1:]
+            all_data[k] = np.full(shape, np.nan)
+
+    for n in range(len(galcen)):
+        all_data[id_colname][n] = ids[n]
+        all_data["xyz"][n] = galcen.data.xyz[:, n].to_value(meta["xyz"]["unit"])
+        all_data["vxyz"][n] = galcen.velocity.d_xyz[:, n].to_value(
+            meta["vxyz"]["unit"]
+        )
+
+        try:
+            aaf = find_actions_staeckel(pot, w0[n])[0]
+        except Exception as e:
+            logger.error(f"Failed to pre-compute actions {i}\n{str(e)}")
+            continue
+
+        T = 4 * np.abs(2 * np.pi / aaf["freqs"].min()).to(u.Gyr)
+        try:
+            orbit = pot.integrate_orbit(
+                w0[n],
+                dt=0.5 * u.Myr,
+                t1=0 * u.Myr,
+                t2=T,
+                Integrator=gi.DOPRI853Integrator,
+            )
+        except Exception as e:
+            logger.error(f"Failed to integrate orbit {i}\n{str(e)}")
+            continue
+
+        # Compute actions / frequencies / angles
+        try:
+            res = find_actions_staeckel(pot, orbit)[0]
+
+            all_data["actions"][n] = res["actions"].to_value(
+                meta["actions"]["unit"]
+            )
+            all_data["angles"][n] = res["angles"].to_value(
+                meta["angles"]["unit"]
+            )
+            all_data["freqs"][n] = res["freqs"].to_value(meta["freqs"]["unit"], u.dimensionless_angles())
+        except Exception as e:
+            logger.error(f"Failed to compute mean actions {i}\n{str(e)}")
+
+        # Other various things:
+        try:
+            rper = orbit.pericenter(approximate=True).to_value(
+                meta["r_per"]["unit"]
+            )
+            rapo = orbit.apocenter(approximate=True).to_value(
+                meta["r_apo"]["unit"]
+            )
+
+            all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
+                meta["z_max"]["unit"]
+            )
+            all_data["r_per"][n] = rper
+            all_data["r_apo"][n] = rapo
+            all_data["ecc"][n] = (rapo - rper) / (rapo + rper)
+        except Exception as e:
+            logger.error(f"Failed to compute zmax peri apo for orbit {i}\n{e}")
+
+        # Lz and E
+        try:
+            all_data["L"][n] = np.mean(
+                orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
+            )
+            all_data["E"][n] = np.mean(
+                orbit.energy().to_value(meta["E"]["unit"])
+            )
+        except Exception as e:
+            logger.error(f"Failed to compute E Lz for orbit {i}\n{e}")
+
+    return idx, cache_file, all_data
+
+
 def callback(res):
     idx, cache_file, all_data = res
 
@@ -142,6 +234,8 @@ def main(
     dist_colname=None,
     rv_colname=None,
     potential_filename=None,
+    galcen_filename=None,
+    use_staeckel=False,
 ):
 
     logger.debug(f"Starting file {source_file}...")
@@ -164,14 +258,37 @@ def main(
         with open(potential_filename, "rb") as f:
             H = pickle.load(f)
         potential_name = potential_filename.parts[-1].split(".")[0]
+    elif potential_filename.suffix in [".yml", ".yaml"]:
+        mw = gp.load(potential_filename)
+        potential_name = potential_filename.name.split('.')[0]
     else:
-        print("/unknown potential file type")
-        return
+        raise ValueError("Unknown potential file type")
 
+    if galcen_filename is None:
+        gc_frame = coord.Galactocentric(
+            galcen_distance=8.275 * u.kpc,
+            galcen_v_sun=[8.4, 251.8, 8.4] * u.km/u.s
+        )
+    else:
+        with open(galcen_filename, "rb") as f:
+            gc_frame = pickle.load(f)
+
+    if use_staeckel:
+        worker = worker_staeckel
+        act_name = 'staeckel'
+    else:
+        worker = worker_o2gf
+        act_name = 'o2gf'
+
+    source_name = source_file.name.split('.')[0]
     cache_file = (
-        cache_path / f"{source_file.name.split('.')[0]}-{potential_name}.hdf5"
+        cache_path / f"{source_name}-{potential_name}-{act_name}.hdf5"
     )
     logger.debug(f"Writing to cache file {cache_file}".format(cache_file))
+
+    galcen_cache_file = (
+        cache_path / f"{source_name}-{potential_name}-{act_name}.galcen.pkl"
+    )
 
     # Load the source data table:
     g = GaiaData(at.QTable.read(source_file))
@@ -196,7 +313,7 @@ def main(
         elif hasattr(g, "dr2_radial_velocity"):
             rv = g.dr2_radial_velocity
         else:
-            raise ValueError("...")
+            raise ValueError("Invalid radial velocity column or dataset")
         mask &= np.isfinite(rv)
     else:
         rv = g.data[rv_colname]
@@ -237,6 +354,7 @@ def main(
         "actions": {"shape": (Nstars, 3), "unit": u.kpc * u.km / u.s},
         "angles": {"shape": (Nstars, 3), "unit": u.rad},
         # Orbit parameters:
+        "R_guide": {"shape": (Nstars,), "unit": u.kpc},
         "z_max": {"shape": (Nstars,), "unit": u.kpc},
         "r_per": {"shape": (Nstars,), "unit": u.kpc},
         "r_apo": {"shape": (Nstars,), "unit": u.kpc},
@@ -318,12 +436,24 @@ if __name__ == "__main__":
         help="Verbose mode.",
     )
 
+    parser.add_argument(
+        "--staeckel",
+        dest="use_staeckel",
+        default=False,
+        action="store_true",
+        help="Use the Staeckel Fudge action solver from Galpy.",
+    )
+
     parser.add_argument("--id-col", dest="id_colname", default=None)
     parser.add_argument("--dist-col", dest="dist_colname", default=None)
     parser.add_argument("--rv-col", dest="rv_colname", default=None)
 
     parser.add_argument(
         "-p", "--potential", dest="potential_filename", default=None
+    )
+
+    parser.add_argument(
+        "-g", "--galcen", dest="galcen_filename", default=None
     )
 
     args = parser.parse_args()
@@ -362,4 +492,6 @@ if __name__ == "__main__":
                 dist_colname=args.dist_colname,
                 rv_colname=args.rv_colname,
                 potential_filename=pathlib.Path(args.potential_filename),
+                galcen_filename=args.galcen_filename,
+                use_staeckel=args.use_staeckel
             )

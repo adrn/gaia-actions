@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig()
 
 
-def worker(task):
+def worker_staeckel(task):
     (i, j), idx, galcen, meta, pot, cache_file, id_colname, ids = task
     ids = ids[idx]
     galcen = galcen[idx]
@@ -133,7 +133,8 @@ def main(
     id_colname=None,
     dist_colname=None,
     rv_colname=None,
-    potential_filename=None
+    potential_filename=None,
+    galcen_filename=None
 ):
 
     logger.debug(f"Starting file {source_file}...")
