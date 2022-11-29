@@ -58,7 +58,7 @@ def worker(task):
             logger.error(f"Failed to pre-compute actions {i}\n{str(e)}")
             continue
 
-        T = np.abs(2 * np.pi / aaf["freqs"].min()).to(u.Gyr)
+        T = 4 * np.abs(2 * np.pi / aaf["freqs"].min()).to(u.Gyr)
         try:
             orbit = pot.integrate_orbit(
                 w0[n],
@@ -145,8 +145,11 @@ def main(
     source_file = pathlib.Path(source_file).resolve()
 
     # Global parameters
-    with coord.galactocentric_frame_defaults.set("v4.0"):
-        gc_frame = coord.Galactocentric()
+    # with coord.galactocentric_frame_defaults.set("v4.0"):
+    gc_frame = coord.Galactocentric(
+        galcen_distance=8.275 * u.kpc,
+        galcen_v_sun=[8.4, 251.8, 8.4] * u.km/u.s
+    )
 
     if potential_filename is not None:
         potential_filename = pathlib.Path(potential_filename).resolve().absolute()
