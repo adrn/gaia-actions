@@ -77,25 +77,25 @@ def worker_o2gf(task):
             )
             orbit = orbit.to_frame(static_frame)
         except Exception as e:
-            logger.error(f"Failed to integrate orbit {i}\n{str(e)}")
+            logger.error(f"Failed to integrate orbit {i+n}\n{str(e)}")
             continue
 
         # Compute actions / frequencies / angles
         try:
-            res = gd.find_actions(orbit, N_max=Nmax)
+            res = gd.find_actions_o2gf(orbit, N_max=Nmax)
             all_data["actions"][n] = res["actions"].to_value(meta["actions"]["unit"])
             all_data["angles"][n] = res["angles"].to_value(meta["angles"]["unit"])
             all_data["freqs"][n] = res["freqs"].to_value(meta["freqs"]["unit"])
         except Exception as e:
-            logger.error(f"Failed to run find actions for orbit {i}\n{str(e)}")
+            logger.error(f"Failed to run find actions for orbit {i+n}\n{str(e)}")
 
         # Lz and E
         try:
-            L = orbit.angular_momentum().to_value(meta["L"]["unit"])
-            all_data["L"][n] = np.mean(L, axis=1)
+            L = orbit.angular_momentum()
+            all_data["L"][n] = np.mean(L, axis=1).to_value(meta["L"]["unit"])
             all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
         except Exception as e:
-            logger.error(f"Failed to compute E Lz for orbit {i}\n{e}")
+            logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
             L = np.full(orbit.xyz.shape, np.nan)
 
         # Other various things:
@@ -104,7 +104,7 @@ def worker_o2gf(task):
             rapo = orbit.apocenter(approximate=True).to_value(meta["r_apo"]["unit"])
 
             vcirc = potential.circular_velocity(orbit.xyz)
-            all_data["R_guide"][n] = np.mean(L[:, 2] / vcirc)
+            all_data["R_guide"][n] = np.mean(L[2] / vcirc).to_value(meta['R_guide']['unit'])
             all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
                 meta["z_max"]["unit"]
             )
@@ -112,7 +112,7 @@ def worker_o2gf(task):
             all_data["r_apo"][n] = rapo
             all_data["ecc"][n] = (rapo - rper) / (rapo + rper)
         except Exception as e:
-            logger.error(f"Failed to compute zmax peri apo for orbit {i}\n{e}")
+            logger.error(f"Failed to compute zmax peri apo for orbit {i+n}\n{e}")
 
     return idx, cache_file, all_data
 
@@ -169,7 +169,7 @@ def worker_staeckel(task):
             )
             orbit = orbit.to_frame(static_frame)
         except Exception as e:
-            logger.error(f"Failed to integrate orbit {i}\n{str(e)}")
+            logger.error(f"Failed to integrate orbit {i+n}\n{str(e)}")
             continue
 
         # Compute actions / frequencies / angles
@@ -182,7 +182,7 @@ def worker_staeckel(task):
                 meta["freqs"]["unit"], u.dimensionless_angles()
             )
         except Exception as e:
-            logger.error(f"Failed to compute mean actions {i}\n{str(e)}")
+            logger.error(f"Failed to compute mean actions {i+n}\n{str(e)}")
 
         # Other various things:
         try:
@@ -196,7 +196,7 @@ def worker_staeckel(task):
             all_data["r_apo"][n] = rapo
             all_data["ecc"][n] = (rapo - rper) / (rapo + rper)
         except Exception as e:
-            logger.error(f"Failed to compute zmax peri apo for orbit {i}\n{e}")
+            logger.error(f"Failed to compute zmax peri apo for orbit {i+n}\n{e}")
 
         # Lz and E
         try:
@@ -205,7 +205,7 @@ def worker_staeckel(task):
             )
             all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
         except Exception as e:
-            logger.error(f"Failed to compute E Lz for orbit {i}\n{e}")
+            logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
 
     return idx, cache_file, all_data
 
