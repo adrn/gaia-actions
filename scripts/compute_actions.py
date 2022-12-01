@@ -104,7 +104,9 @@ def worker_o2gf(task):
             rapo = orbit.apocenter(approximate=True).to_value(meta["r_apo"]["unit"])
 
             vcirc = potential.circular_velocity(orbit.xyz)
-            all_data["R_guide"][n] = np.mean(L[2] / vcirc).to_value(meta['R_guide']['unit'])
+            all_data["R_guide"][n] = np.abs(
+                np.mean(L[2] / vcirc).to_value(meta["R_guide"]["unit"])
+            )
             all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
                 meta["z_max"]["unit"]
             )
@@ -278,7 +280,7 @@ def main(
     galcen_cache_file = (
         cache_path / f"{source_name}-{potential_name}-{act_name}.galcen.pkl"
     )
-    with open(galcen_cache_file, 'wb') as f:
+    with open(galcen_cache_file, "wb") as f:
         pickle.dump(gc_frame, f)
 
     # Load the source data table:
