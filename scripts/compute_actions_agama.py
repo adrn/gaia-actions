@@ -57,7 +57,7 @@ def worker_agama(task):
             )
         )
 
-    for k in ["bulge", "nucl"]:
+    for k in ["bulge", "nucleus"]:
         p = gala_potential[k]
         agama_components.append(
             dict(
