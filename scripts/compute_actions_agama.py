@@ -107,7 +107,7 @@ def worker_agama(task):
             continue
 
         act = act * u.kpc**2 / u.Myr
-        freq = freq * u.Myr
+        freq = freq / u.Myr
         ang = ang * u.rad
 
         T = 4 * np.abs(2 * np.pi / freq.min()).to(u.Gyr)
