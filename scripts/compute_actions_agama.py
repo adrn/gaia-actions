@@ -125,10 +125,10 @@ def worker_agama(task):
             continue
 
         # Compute actions / frequencies / angles
-        idx = [0, 2, 1]
-        all_data["actions"][n] = act[idx].to_value(meta["actions"]["unit"])
-        all_data["angles"][n] = ang[idx].to_value(meta["angles"]["unit"])
-        all_data["freqs"][n] = freq[idx].to_value(
+        reorder = [0, 2, 1]
+        all_data["actions"][n] = act[reorder].to_value(meta["actions"]["unit"])
+        all_data["angles"][n] = ang[reorder].to_value(meta["angles"]["unit"])
+        all_data["freqs"][n] = freq[reorder].to_value(
             meta["freqs"]["unit"], u.dimensionless_angles()
         )
 
