@@ -98,12 +98,14 @@ def worker_agama(task):
         all_data[id_colname][n] = ids[n]
         all_data["xyz"][n] = galcen.data.xyz[:, n].to_value(meta["xyz"]["unit"])
         all_data["vxyz"][n] = galcen.velocity.d_xyz[:, n].to_value(meta["vxyz"]["unit"])
+        all_data["flags"][n] = 0
 
         xv = np.squeeze(w0[n].w(gala_potential.units))
         try:
             act, ang, freq = act_finder(xv, angles=True)
         except Exception as e:
             logger.error(f"Failed to compute actions {i}\n{str(e)}")
+            all_data["flags"][n] += 2**1
             continue
 
         act = act * u.kpc**2 / u.Myr
@@ -122,6 +124,7 @@ def worker_agama(task):
             orbit = orbit.to_frame(static_frame)
         except Exception as e:
             logger.error(f"Failed to integrate orbit {i+n}\n{str(e)}")
+            all_data["flags"][n] += 2**2
             continue
 
         # Compute actions / frequencies / angles
@@ -145,6 +148,7 @@ def worker_agama(task):
             all_data["ecc"][n] = (rapo - rper) / (rapo + rper)
         except Exception as e:
             logger.error(f"Failed to compute zmax peri apo for orbit {i+n}\n{e}")
+            all_data["flags"][n] += 2**3
 
         # Lz and E
         try:
@@ -154,6 +158,7 @@ def worker_agama(task):
             all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
         except Exception as e:
             logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
+            all_data["flags"][n] += 2**4
 
     return idx, cache_file, all_data
 
@@ -248,12 +253,13 @@ def main(
 
     # Get coordinates, and only keep good values:
     if ~np.all(mask):
-        logger.warning(f"Filtering {mask.sum()} bad distance or RV values")
+        logger.warning(f"Filtering {len(mask) - mask.sum()} bad distance or RV values")
 
-    c = g[mask].get_skycoord(
-        distance=u.Quantity(dist[mask]), radial_velocity=u.Quantity(rv[mask])
-    )
-    ids = ids[mask]
+    if hasattr(dist, "filled"):
+        dist = dist.filled(np.nan)
+    if hasattr(rv, "filled"):
+        rv = rv.filled(np.nan)
+    c = g.get_skycoord(distance=u.Quantity(dist), radial_velocity=u.Quantity(rv))
 
     galcen = c.transform_to(gc_frame)
     logger.debug("Data loaded...")
@@ -281,6 +287,7 @@ def main(
         "ecc": {"shape": (Nstars,), "unit": u.one},
         "L": {"shape": (Nstars, 3), "unit": u.kpc * u.km / u.s},
         "E": {"shape": (Nstars,), "unit": (u.km / u.s) ** 2},
+        "flags": {"shape": (Nstars,), "dtype": "i8", "fillvalue": -1},
     }
 
     # Make sure output file exists
@@ -296,15 +303,15 @@ def main(
                 if "unit" in info:
                     d.attrs["unit"] = str(info["unit"])
 
+            f["flags"][np.where(~mask)] = 1
+
     # If path exists, see what indices are not already done
     with h5py.File(cache_file, "r") as f:
-        i1 = np.all(np.isnan(f["freqs"][:]), axis=1)
-        i2 = np.isnan(f["ecc"][:])
-        todo_idx = np.where(i1 & i2)[0]
+        todo_idx = np.where((f["flags"] == -1) & mask)[0]
 
     logger.info(f"{len(todo_idx)} left to process")
 
-    n_batches = min(16 * max(1, pool.size - 1), len(todo_idx))
+    n_batches = min(8 * max(1, pool.size - 1), len(todo_idx))
     tasks = batch_tasks(
         n_batches=n_batches,
         arr=todo_idx,
