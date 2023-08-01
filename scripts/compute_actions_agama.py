@@ -307,7 +307,7 @@ def main(
 
     # If path exists, see what indices are not already done
     with h5py.File(cache_file, "r") as f:
-        todo_idx = np.where((f["flags"] == -1) & mask)[0]
+        todo_idx = np.where((f["flags"][:] == -1) & mask)[0]
 
     logger.info(f"{len(todo_idx)} left to process")
 
