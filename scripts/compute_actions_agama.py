@@ -160,6 +160,13 @@ def worker_agama(task):
             logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
             all_data["flags"][n] += 2**4
 
+        try:
+            vc = gala_potential.circular_velocity(orbit.xyz)
+            all_data["R_guide"][n] = all_data["L"][n][2] / np.median(vc)
+        except Exception as e:
+            logger.error(f"Failed to compute R_guide for orbit {i+n}\n{e}")
+            all_data["flags"][n] += 2**5
+
     return idx, cache_file, all_data
 
 
