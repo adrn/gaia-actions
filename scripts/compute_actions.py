@@ -105,7 +105,7 @@ def worker_o2gf(task):
 
             vcirc = potential.circular_velocity(orbit.xyz)
             all_data["R_guide"][n] = np.abs(
-                np.mean(L[2] / vcirc).to_value(meta["R_guide"]["unit"])
+                np.nanmean(L[2] / vcirc).to_value(meta["R_guide"]["unit"])
             )
             all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
                 meta["z_max"]["unit"]
@@ -160,7 +160,10 @@ def worker_staeckel(task):
             logger.error(f"Failed to pre-compute actions {i}\n{str(e)}")
             continue
 
-        T = 4 * np.abs(2 * np.pi / aaf["freqs"].min()).to(u.Gyr)
+        T = 4 * np.abs(2 * np.pi / np.nanmin(aaf["freqs"])).to(u.Gyr)
+        if np.isnan(T):  # HACK:
+            T = 10 * u.Gyr
+            
         try:
             orbit = H.integrate_orbit(
                 w0[n],
@@ -202,10 +205,8 @@ def worker_staeckel(task):
 
         # Lz and E
         try:
-            all_data["L"][n] = np.mean(
-                orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
-            )
-            all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
+            all_data["L"][n] = orbit.angular_momentum()[:, 0].to_value(meta["L"]["unit"])
+            all_data["E"][n] = orbit.energy()[0].to_value(meta["E"]["unit"])
         except Exception as e:
             logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
 
@@ -295,9 +296,10 @@ def main(
 
     if dist_colname is None:  # assumes gaia
         dist = coord.Distance(parallax=g.parallax, allow_negative=True)
-        mask &= np.isfinite(dist)
     else:
         dist = g.data[dist_colname]
+        
+    mask &= np.isfinite(dist)
     mask &= dist > 0
 
     if rv_colname is None:  # assumes gaia
@@ -307,9 +309,9 @@ def main(
             rv = g.dr2_radial_velocity
         else:
             raise ValueError("Invalid radial velocity column or dataset")
-        mask &= np.isfinite(rv)
     else:
         rv = g.data[rv_colname]
+    mask &= np.isfinite(rv)
 
     if not hasattr(dist, "unit") or dist.unit == u.one or dist.unit is None:
         logger.warning("No distance unit specified in table - assuming kpc")

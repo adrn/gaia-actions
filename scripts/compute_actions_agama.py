@@ -11,19 +11,17 @@ import sys
 from astropy.utils import iers
 
 iers.conf.auto_download = False
-import astropy.table as at
+import agama
 import astropy.coordinates as coord
+import astropy.table as at
 import astropy.units as u
-import numpy as np
-import h5py
-from pyia import GaiaData
-
 import gala.dynamics as gd
 import gala.integrate as gi
 import gala.potential as gp
+import h5py
+import numpy as np
+from pyia import GaiaData
 from schwimmbad.utils import batch_tasks
-
-import agama
 
 agama.setUnits(mass=u.Msun, length=u.kpc, time=u.Myr)
 logger = logging.getLogger(__name__)
@@ -37,6 +35,7 @@ def worker_agama(task):
         galcen,
         meta,
         gala_potential,
+        agama_components,
         frame,
         cache_file,
         id_colname,
@@ -45,37 +44,6 @@ def worker_agama(task):
     ids = ids[idx]
     galcen = galcen[idx]
 
-    # Convert to Agama potential:
-    agama_components = []
-    for p in gala_potential["disk"].get_three_potentials().values():
-        agama_components.append(
-            dict(
-                type="miyamotonagai",
-                mass=p.parameters["m"].value,
-                scaleradius=p.parameters["a"].value,
-                scaleheight=p.parameters["b"].value,
-            )
-        )
-
-    for k in ["bulge", "nucleus"]:
-        p = gala_potential[k]
-        agama_components.append(
-            dict(
-                type="dehnen",
-                mass=p.parameters["m"].value,
-                scaleradius=p.parameters["c"].value,
-                gamma=1.0,
-            )
-        )
-
-    p = gala_potential["halo"]
-    agama_components.append(
-        dict(
-            type="nfw",
-            mass=p.parameters["m"].value,
-            scaleradius=p.parameters["r_s"].value,
-        )
-    )
     agama_pot = agama.Potential(*agama_components)
 
     w0 = gd.PhaseSpacePosition(galcen.cartesian)
@@ -112,7 +80,8 @@ def worker_agama(task):
         freq = freq / u.Myr
         ang = ang * u.rad
 
-        T = 4 * np.abs(2 * np.pi / freq.min()).to(u.Gyr)
+        # Note: 4 is a magic number
+        T = 4 * np.max(np.abs(2 * np.pi / freq).to(u.Gyr))
         try:
             orbit = H.integrate_orbit(
                 w0[n],
@@ -135,10 +104,26 @@ def worker_agama(task):
             meta["freqs"]["unit"], u.dimensionless_angles()
         )
 
+        # L and E
+        try:
+            all_data["L"][n] = np.mean(
+                orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
+            )
+            all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
+        except Exception as e:
+            logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
+            all_data["flags"][n] += 2**4
+
         # Other various things:
         try:
             rper = orbit.pericenter(approximate=True).to_value(meta["r_per"]["unit"])
             rapo = orbit.apocenter(approximate=True).to_value(meta["r_apo"]["unit"])
+
+            vcirc = gala_potential.circular_velocity(orbit.xyz)
+            L = all_data["L"][n]
+            all_data["R_guide"][n] = np.abs(
+                np.nanmean(L[2] / vcirc).to_value(meta["R_guide"]["unit"])
+            )
 
             all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
                 meta["z_max"]["unit"]
@@ -149,16 +134,6 @@ def worker_agama(task):
         except Exception as e:
             logger.error(f"Failed to compute zmax peri apo for orbit {i+n}\n{e}")
             all_data["flags"][n] += 2**3
-
-        # Lz and E
-        try:
-            all_data["L"][n] = np.mean(
-                orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
-            )
-            all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
-        except Exception as e:
-            logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
-            all_data["flags"][n] += 2**4
 
     return idx, cache_file, all_data
 
@@ -194,6 +169,38 @@ def main(
     gala_pot = gp.MilkyWayPotential2022()
     potential_name = "MilkyWayPotential2022"
     act_name = "agama"
+
+    # Convert to Agama potential:
+    agama_components = []
+    for p in gala_pot["disk"].get_three_potentials().values():
+        agama_components.append(
+            dict(
+                type="miyamotonagai",
+                mass=p.parameters["m"].value,
+                scaleradius=p.parameters["a"].value,
+                scaleheight=p.parameters["b"].value,
+            )
+        )
+
+    for k in ["bulge", "nucleus"]:
+        p = gala_pot[k]
+        agama_components.append(
+            dict(
+                type="dehnen",
+                mass=p.parameters["m"].value,
+                scaleradius=p.parameters["c"].value,
+                gamma=1.0,
+            )
+        )
+
+    p = gala_pot["halo"]
+    agama_components.append(
+        dict(
+            type="nfw",
+            mass=p.parameters["m"].value,
+            scaleradius=p.parameters["r_s"].value,
+        )
+    )
 
     H = gp.Hamiltonian(gala_pot)
 
@@ -315,7 +322,16 @@ def main(
     tasks = batch_tasks(
         n_batches=n_batches,
         arr=todo_idx,
-        args=(galcen, meta, H.potential, H.frame, cache_file, id_colname, ids),
+        args=(
+            galcen,
+            meta,
+            H.potential,
+            agama_components,
+            H.frame,
+            cache_file,
+            id_colname,
+            ids,
+        ),
     )
     for r in pool.map(worker_agama, tasks, callback=callback):
         pass
@@ -325,9 +341,9 @@ def main(
 
 
 if __name__ == "__main__":
-    from threadpoolctl import threadpool_limits
-
     from argparse import ArgumentParser
+
+    from threadpoolctl import threadpool_limits
 
     parser = ArgumentParser(description="")
 
