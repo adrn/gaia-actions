@@ -119,10 +119,8 @@ def worker_agama(task):
             rper = orbit.pericenter(approximate=True).to_value(meta["r_per"]["unit"])
             rapo = orbit.apocenter(approximate=True).to_value(meta["r_apo"]["unit"])
 
-            vcirc = gala_potential.circular_velocity(orbit.xyz)
-            L = all_data["L"][n]
-            all_data["R_guide"][n] = np.abs(
-                np.nanmean(L[2] / vcirc).to_value(meta["R_guide"]["unit"])
+            all_data["R_guide"][n] = w0.guiding_radius(gala_potential).to_value(
+                meta["R_guide"]["unit"]
             )
 
             all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
@@ -153,8 +151,11 @@ def main(
     overwrite=False,
     id_colname=None,
     dist_colname=None,
+    dist_err_colname=None,
     rv_colname=None,
+    rv_err_colname=None,
     galcen_filename=None,
+    N_error_samples=0,
 ):
     logger.debug(f"Starting file {source_file}...")
 
@@ -205,12 +206,12 @@ def main(
     H = gp.Hamiltonian(gala_pot)
 
     if galcen_filename is None:
-        gc_frame = coord.Galactocentric(
+        galcen_frame = coord.Galactocentric(
             galcen_distance=8.275 * u.kpc, galcen_v_sun=[8.4, 251.8, 8.4] * u.km / u.s
         )
     else:
         with open(galcen_filename, "rb") as f:
-            gc_frame = pickle.load(f)
+            galcen_frame = pickle.load(f)
 
     source_name = source_file.name.split(".")[0]
     cache_file = cache_path / f"{source_name}-{potential_name}-{act_name}.hdf5"
@@ -220,7 +221,7 @@ def main(
         cache_path / f"{source_name}-{potential_name}-{act_name}.galcen.pkl"
     )
     with open(galcen_cache_file, "wb") as f:
-        pickle.dump(gc_frame, f)
+        pickle.dump(galcen_frame, f)
 
     # Load the source data table:
     g = GaiaData(at.QTable.read(source_file))
@@ -268,7 +269,7 @@ def main(
         rv = rv.filled(np.nan)
     c = g.get_skycoord(distance=u.Quantity(dist), radial_velocity=u.Quantity(rv))
 
-    galcen = c.transform_to(gc_frame)
+    galcen = c.transform_to(galcen_frame)
     logger.debug("Data loaded...")
 
     Nstars = len(c)
@@ -282,7 +283,7 @@ def main(
         },
         "xyz": {"shape": (Nstars, 3), "unit": u.kpc},
         "vxyz": {"shape": (Nstars, 3), "unit": u.km / u.s},
-        # Frequencies, actions, and angles computed with Sanders & Binney
+        # Frequencies, actions, and angles:
         "freqs": {"shape": (Nstars, 3), "unit": u.rad / u.Gyr},
         "actions": {"shape": (Nstars, 3), "unit": u.kpc * u.km / u.s},
         "angles": {"shape": (Nstars, 3), "unit": u.rad},
@@ -381,7 +382,10 @@ if __name__ == "__main__":
 
     parser.add_argument("--id-col", dest="id_colname", default=None)
     parser.add_argument("--dist-col", dest="dist_colname", default=None)
-    parser.add_argument("--rv-col", dest="rv_colname", default=None)
+    parser.add_argument("--dist-err-col", dest="dist_err_colname", default=None)
+    parser.add_argument("--rv-err-col", dest="rv_err_colname", default=None)
+
+    parser.add_argument("--n-error-samples", dest="N_error_samples", default=0)
 
     parser.add_argument("-g", "--galcen", dest="galcen_filename", default=None)
 
@@ -419,6 +423,9 @@ if __name__ == "__main__":
                 overwrite=args.overwrite,
                 id_colname=args.id_colname,
                 dist_colname=args.dist_colname,
+                dist_err_colname=args.dist_err_colname,
                 rv_colname=args.rv_colname,
+                rv_err_colname=args.rv_err_colname,
                 galcen_filename=args.galcen_filename,
+                N_error_samples=args.N_error_samples,
             )
