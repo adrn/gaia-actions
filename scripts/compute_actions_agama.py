@@ -11,19 +11,17 @@ import sys
 from astropy.utils import iers
 
 iers.conf.auto_download = False
-import astropy.table as at
+import agama
 import astropy.coordinates as coord
+import astropy.table as at
 import astropy.units as u
-import numpy as np
-import h5py
-from pyia import GaiaData
-
 import gala.dynamics as gd
 import gala.integrate as gi
 import gala.potential as gp
+import h5py
+import numpy as np
+from pyia import GaiaData
 from schwimmbad.utils import batch_tasks
-
-import agama
 
 agama.setUnits(mass=u.Msun, length=u.kpc, time=u.Myr)
 logger = logging.getLogger(__name__)
@@ -37,6 +35,7 @@ def worker_agama(task):
         galcen,
         meta,
         gala_potential,
+        agama_components,
         frame,
         cache_file,
         id_colname,
@@ -45,37 +44,6 @@ def worker_agama(task):
     ids = ids[idx]
     galcen = galcen[idx]
 
-    # Convert to Agama potential:
-    agama_components = []
-    for p in gala_potential["disk"].get_three_potentials().values():
-        agama_components.append(
-            dict(
-                type="miyamotonagai",
-                mass=p.parameters["m"].value,
-                scaleradius=p.parameters["a"].value,
-                scaleheight=p.parameters["b"].value,
-            )
-        )
-
-    for k in ["bulge", "nucleus"]:
-        p = gala_potential[k]
-        agama_components.append(
-            dict(
-                type="dehnen",
-                mass=p.parameters["m"].value,
-                scaleradius=p.parameters["c"].value,
-                gamma=1.0,
-            )
-        )
-
-    p = gala_potential["halo"]
-    agama_components.append(
-        dict(
-            type="nfw",
-            mass=p.parameters["m"].value,
-            scaleradius=p.parameters["r_s"].value,
-        )
-    )
     agama_pot = agama.Potential(*agama_components)
 
     w0 = gd.PhaseSpacePosition(galcen.cartesian)
@@ -112,7 +80,8 @@ def worker_agama(task):
         freq = freq / u.Myr
         ang = ang * u.rad
 
-        T = 4 * np.abs(2 * np.pi / freq.min()).to(u.Gyr)
+        # Note: 4 is a magic number
+        T = 4 * np.max(np.abs(2 * np.pi / freq).to(u.Gyr))
         try:
             orbit = H.integrate_orbit(
                 w0[n],
@@ -135,10 +104,24 @@ def worker_agama(task):
             meta["freqs"]["unit"], u.dimensionless_angles()
         )
 
+        # L and E
+        try:
+            all_data["L"][n] = np.mean(
+                orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
+            )
+            all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
+        except Exception as e:
+            logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
+            all_data["flags"][n] += 2**4
+
         # Other various things:
         try:
             rper = orbit.pericenter(approximate=True).to_value(meta["r_per"]["unit"])
             rapo = orbit.apocenter(approximate=True).to_value(meta["r_apo"]["unit"])
+
+            all_data["R_guide"][n] = w0.guiding_radius(gala_potential).to_value(
+                meta["R_guide"]["unit"]
+            )
 
             all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
                 meta["z_max"]["unit"]
@@ -149,23 +132,6 @@ def worker_agama(task):
         except Exception as e:
             logger.error(f"Failed to compute zmax peri apo for orbit {i+n}\n{e}")
             all_data["flags"][n] += 2**3
-
-        # Lz and E
-        try:
-            all_data["L"][n] = np.mean(
-                orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
-            )
-            all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
-        except Exception as e:
-            logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
-            all_data["flags"][n] += 2**4
-
-        try:
-            vc = gala_potential.circular_velocity(orbit.xyz)
-            all_data["R_guide"][n] = all_data["L"][n][2] / np.median(vc)
-        except Exception as e:
-            logger.error(f"Failed to compute R_guide for orbit {i+n}\n{e}")
-            all_data["flags"][n] += 2**5
 
     return idx, cache_file, all_data
 
@@ -185,8 +151,11 @@ def main(
     overwrite=False,
     id_colname=None,
     dist_colname=None,
+    dist_err_colname=None,
     rv_colname=None,
+    rv_err_colname=None,
     galcen_filename=None,
+    N_error_samples=0,
 ):
     logger.debug(f"Starting file {source_file}...")
 
@@ -202,15 +171,47 @@ def main(
     potential_name = "MilkyWayPotential2022"
     act_name = "agama"
 
+    # Convert to Agama potential:
+    agama_components = []
+    for p in gala_pot["disk"].get_three_potentials().values():
+        agama_components.append(
+            dict(
+                type="miyamotonagai",
+                mass=p.parameters["m"].value,
+                scaleradius=p.parameters["a"].value,
+                scaleheight=p.parameters["b"].value,
+            )
+        )
+
+    for k in ["bulge", "nucleus"]:
+        p = gala_pot[k]
+        agama_components.append(
+            dict(
+                type="dehnen",
+                mass=p.parameters["m"].value,
+                scaleradius=p.parameters["c"].value,
+                gamma=1.0,
+            )
+        )
+
+    p = gala_pot["halo"]
+    agama_components.append(
+        dict(
+            type="nfw",
+            mass=p.parameters["m"].value,
+            scaleradius=p.parameters["r_s"].value,
+        )
+    )
+
     H = gp.Hamiltonian(gala_pot)
 
     if galcen_filename is None:
-        gc_frame = coord.Galactocentric(
+        galcen_frame = coord.Galactocentric(
             galcen_distance=8.275 * u.kpc, galcen_v_sun=[8.4, 251.8, 8.4] * u.km / u.s
         )
     else:
         with open(galcen_filename, "rb") as f:
-            gc_frame = pickle.load(f)
+            galcen_frame = pickle.load(f)
 
     source_name = source_file.name.split(".")[0]
     cache_file = cache_path / f"{source_name}-{potential_name}-{act_name}.hdf5"
@@ -220,7 +221,7 @@ def main(
         cache_path / f"{source_name}-{potential_name}-{act_name}.galcen.pkl"
     )
     with open(galcen_cache_file, "wb") as f:
-        pickle.dump(gc_frame, f)
+        pickle.dump(galcen_frame, f)
 
     # Load the source data table:
     g = GaiaData(at.QTable.read(source_file))
@@ -268,7 +269,7 @@ def main(
         rv = rv.filled(np.nan)
     c = g.get_skycoord(distance=u.Quantity(dist), radial_velocity=u.Quantity(rv))
 
-    galcen = c.transform_to(gc_frame)
+    galcen = c.transform_to(galcen_frame)
     logger.debug("Data loaded...")
 
     Nstars = len(c)
@@ -282,7 +283,7 @@ def main(
         },
         "xyz": {"shape": (Nstars, 3), "unit": u.kpc},
         "vxyz": {"shape": (Nstars, 3), "unit": u.km / u.s},
-        # Frequencies, actions, and angles computed with Sanders & Binney
+        # Frequencies, actions, and angles:
         "freqs": {"shape": (Nstars, 3), "unit": u.rad / u.Gyr},
         "actions": {"shape": (Nstars, 3), "unit": u.kpc * u.km / u.s},
         "angles": {"shape": (Nstars, 3), "unit": u.rad},
@@ -322,7 +323,16 @@ def main(
     tasks = batch_tasks(
         n_batches=n_batches,
         arr=todo_idx,
-        args=(galcen, meta, H.potential, H.frame, cache_file, id_colname, ids),
+        args=(
+            galcen,
+            meta,
+            H.potential,
+            agama_components,
+            H.frame,
+            cache_file,
+            id_colname,
+            ids,
+        ),
     )
     for r in pool.map(worker_agama, tasks, callback=callback):
         pass
@@ -332,9 +342,9 @@ def main(
 
 
 if __name__ == "__main__":
-    from threadpoolctl import threadpool_limits
-
     from argparse import ArgumentParser
+
+    from threadpoolctl import threadpool_limits
 
     parser = ArgumentParser(description="")
 
@@ -372,7 +382,10 @@ if __name__ == "__main__":
 
     parser.add_argument("--id-col", dest="id_colname", default=None)
     parser.add_argument("--dist-col", dest="dist_colname", default=None)
-    parser.add_argument("--rv-col", dest="rv_colname", default=None)
+    parser.add_argument("--dist-err-col", dest="dist_err_colname", default=None)
+    parser.add_argument("--rv-err-col", dest="rv_err_colname", default=None)
+
+    parser.add_argument("--n-error-samples", dest="N_error_samples", default=0)
 
     parser.add_argument("-g", "--galcen", dest="galcen_filename", default=None)
 
@@ -410,6 +423,9 @@ if __name__ == "__main__":
                 overwrite=args.overwrite,
                 id_colname=args.id_colname,
                 dist_colname=args.dist_colname,
+                dist_err_colname=args.dist_err_colname,
                 rv_colname=args.rv_colname,
+                rv_err_colname=args.rv_err_colname,
                 galcen_filename=args.galcen_filename,
+                N_error_samples=args.N_error_samples,
             )
