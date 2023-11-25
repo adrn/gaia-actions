@@ -68,11 +68,16 @@ def get_c_error_samples(g, N_error_samples, colnames, rng):
 
     y = y[:, 0]
     if N_error_samples > 0:
-        samples = np.concatenate(
-            ([y], rng.multivariate_normal(y, C, size=N_error_samples))
-        ).T
+        try:
+            samples = rng.multivariate_normal(y, C, size=N_error_samples)
+        except np.linalg.LinAlgError:
+            logger.error(
+                f"Failed to sample from error distribution for source {g.source_id}"
+            )
+            samples = np.full((N_error_samples, 6), np.nan)
+        samples = np.concatenate(([y], samples)).T
     else:
-        samples = y
+        samples = y[:, None]
 
     data = dict(
         ra=samples[0] * units["ra"],
@@ -145,6 +150,7 @@ def worker_agama(task):
     for n, i in enumerate(np.sort(idx)):
         all_data[colnames["id"]][n] = getattr(g, colnames["id"])[n]
 
+        # Always comes back with ndim > 0
         c_n = get_c_error_samples(
             g[n], N_error_samples=N_error_samples, colnames=colnames, rng=rng
         )
@@ -154,12 +160,17 @@ def worker_agama(task):
         galcen = c_n.transform_to(galcen_frame)
         w0 = gd.PhaseSpacePosition(galcen.cartesian)
 
-        xv = np.squeeze(w0.w(gala_potential.units))
-        bad_mean = np.any(~np.isfinite(xv.T.flat[:6]))
+        xv = w0.w(gala_potential.units).T  # shape (N, 6)
+        bad_mean = np.any(~np.isfinite(xv[0]))
+        good_xv_mask = np.all(np.isfinite(xv), axis=1)
         if bad_mean:
             logger.error(
                 f"Failed to compute xyz, vxyz for catalog value for source {i}"
             )
+            all_data["flags"][n] += 2**0
+            continue
+        if not np.any(good_xv_mask):
+            logger.error(f"All xyz, vxyz for error samples are bad values {i}")
             all_data["flags"][n] += 2**0
             continue
 
@@ -168,7 +179,7 @@ def worker_agama(task):
         all_data["flags"][n] = 0
 
         try:
-            act, ang, freq = act_finder(xv.T, angles=True)
+            act, ang, freq = act_finder(xv, angles=True)
         except Exception as e:
             logger.error(f"Failed to compute actions {i}\n{str(e)}")
             all_data["flags"][n] += 2**1
@@ -179,15 +190,19 @@ def worker_agama(task):
         ang = ang * u.rad
 
         # Note: 4 is a magic number, so is 32 Gyr
-        T = min(4 * np.max(np.abs(2 * np.pi / freq).to(u.Gyr)), 32 * u.Gyr)
+        T = min(
+            4 * np.max(np.abs(2 * np.pi / freq[good_xv_mask]).to(u.Gyr)), 32 * u.Gyr
+        )
         try:
             orbit = H.integrate_orbit(
-                w0,
+                w0[good_xv_mask],
                 dt=0.5 * u.Myr,
                 t1=0 * u.Myr,
                 t2=T,
                 Integrator=gi.DOPRI853Integrator,
             )
+            if len(orbit.shape) < 2:
+                orbit = orbit[:, None]
             # orbit = orbit.to_frame(static_frame)
         except Exception as e:
             logger.error(f"Failed to integrate orbit {i+n}\n{str(e)}")
@@ -203,33 +218,47 @@ def worker_agama(task):
         )
 
         # L and E
+        L = np.full((3, len(c_n)), np.nan)
+        E = np.full((len(c_n),), np.nan)
         try:
-            all_data["L"][n] = np.mean(
+            L[:, good_xv_mask] = np.mean(
                 orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
-            ).T
-            all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
+            )
+            E[good_xv_mask] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
         except Exception as e:
             logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
             all_data["flags"][n] += 2**4
+        all_data["L"][n] = np.squeeze(L.T)
+        all_data["E"][n] = np.squeeze(E)
 
         # Other various things:
+        zmax = np.full((len(c_n),), np.nan)
+        rper = np.full((len(c_n),), np.nan)
+        rapo = np.full((len(c_n),), np.nan)
+        ecc = np.full((len(c_n),), np.nan)
         try:
-            rper = orbit.pericenter(approximate=True).to_value(meta["r_per"]["unit"])
-            rapo = orbit.apocenter(approximate=True).to_value(meta["r_apo"]["unit"])
-
             all_data["R_guide"][n] = w0.guiding_radius(gala_potential).to_value(
                 meta["R_guide"]["unit"]
             )
 
-            all_data["z_max"][n] = orbit.zmax(approximate=True).to_value(
+            zmax[good_xv_mask] = orbit.zmax(approximate=True).to_value(
                 meta["z_max"]["unit"]
             )
-            all_data["r_per"][n] = rper
-            all_data["r_apo"][n] = rapo
-            all_data["ecc"][n] = (rapo - rper) / (rapo + rper)
+            rper[good_xv_mask] = orbit.pericenter(approximate=True).to_value(
+                meta["r_per"]["unit"]
+            )
+            rapo[good_xv_mask] = orbit.apocenter(approximate=True).to_value(
+                meta["r_apo"]["unit"]
+            )
+            ecc = (rapo - rper) / (rapo + rper)
         except Exception as e:
             logger.error(f"Failed to compute zmax peri apo for orbit {i+n}\n{e}")
             all_data["flags"][n] += 2**3
+
+        all_data["z_max"][n] = np.squeeze(zmax)
+        all_data["r_per"][n] = np.squeeze(rper)
+        all_data["r_apo"][n] = np.squeeze(rapo)
+        all_data["ecc"][n] = np.squeeze(ecc)
 
     return idx, cache_file, all_data
 
@@ -368,10 +397,11 @@ def main(
 
     # If path exists, see what indices are not already done
     with h5py.File(cache_file, "r") as f:
-        if len(base_shape) > 1:
-            todo_idx = np.where(np.any(f["flags"][:] == -1, axis=1))[0]
+        flags = f["flags"][:]
+        if flags.ndim > 1:
+            todo_idx = np.where(np.any(flags == -1, axis=1))[0]
         else:
-            todo_idx = np.where(f["flags"][:] == -1)[0]
+            todo_idx = np.where(flags == -1)[0]
 
     logger.info(f"{len(todo_idx)} sources left to process")
 
