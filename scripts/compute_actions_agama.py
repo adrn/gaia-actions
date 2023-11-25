@@ -97,6 +97,7 @@ def get_c_error_samples(g, N_error_samples, colnames, rng):
         else:
             dist_unit = dist.unit
         data["distance"] = samples[2] * dist_unit
+        data["distance"][data["distance"] < 0] = np.nan * dist_unit
 
     if not hasattr(rv, "unit") or rv.unit == u.one or rv.unit is None:
         logger.warning("No RV unit specified in table - assuming km/s")
