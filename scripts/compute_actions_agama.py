@@ -20,6 +20,8 @@ import gala.integrate as gi
 import gala.potential as gp
 import h5py
 import numpy as np
+from astropy.io import fits
+from astropy.io.fits.column import FITS2NUMPY
 from pyia import GaiaData
 from schwimmbad.utils import batch_tasks
 
@@ -27,50 +29,146 @@ agama.setUnits(mass=u.Msun, length=u.kpc, time=u.Myr)
 logger = logging.getLogger(__name__)
 logging.basicConfig()
 
+act_name = "agama"
+
+
+def get_c_error_samples(g, N_error_samples, colnames, rng):
+    """
+    Only works for one star at a time
+    """
+    C, units = g.get_cov()
+    C = C[0]  # only one star at a time
+
+    y = np.full((6, 1), np.nan)
+    y[0] = g.ra.to_value(units["ra"])
+    y[1] = g.dec.to_value(units["dec"])
+    y[3] = g.pmra.to_value(units["pmra"])
+    y[4] = g.pmdec.to_value(units["pmdec"])
+
+    if colnames["dist"] == "parallax":
+        y[2] = g.parallax.to_value(units["parallax"])
+    else:
+        dist = getattr(g, colnames["dist"])
+        y[2] = dist.value if hasattr(dist, "unit") else dist
+
+        dist_err = getattr(g, colnames["dist_err"])
+        C[:, 2] = C[2] = 0.0
+        C[2, 2] = dist_err.value**2 if hasattr(dist_err, "unit") else dist_err ** 2
+
+    if colnames["rv"] == "radial_velocity":
+        rv = g.radial_velocity
+        y[5] = rv.to_value(units["radial_velocity"])
+    else:
+        rv = getattr(g, colnames["rv"])
+        y[5] = rv.value if hasattr(rv, "unit") else rv
+
+        rv_err = getattr(g, colnames["rv_err"])
+        C[:, 5] = C[5] = 0.0
+        C[5, 5] = rv_err.value**2 if hasattr(rv_err, "unit") else rv_err ** 2
+
+    y = y[:, 0]
+    if N_error_samples > 0:
+        samples = np.concatenate(
+            ([y], rng.multivariate_normal(y, C, size=N_error_samples))
+        ).T
+    else:
+        samples = y
+
+    data = dict(
+        ra=samples[0] * units["ra"],
+        dec=samples[1] * units["dec"],
+        pm_ra_cosdec=samples[3] * units["pmra"],
+        pm_dec=samples[4] * units["pmdec"],
+    )
+
+    if colnames["dist"] == "parallax":
+        data["distance"] = coord.Distance(
+            parallax=samples[2] * units["parallax"], allow_negative=True
+        )
+    else:
+        if not hasattr(dist, "unit") or dist.unit == u.one or dist.unit is None:
+            logger.warning("No distance unit specified in table - assuming kpc")
+            dist_unit = u.kpc
+        else:
+            dist_unit = dist.unit
+        data["distance"] = samples[2] * dist_unit
+
+    if not hasattr(rv, "unit") or rv.unit == u.one or rv.unit is None:
+        logger.warning("No RV unit specified in table - assuming km/s")
+        rv_unit = u.km / u.s
+    else:
+        rv_unit = rv.unit
+    data["radial_velocity"] = samples[5] * rv_unit
+
+    for k, v in data.items():
+        if hasattr(v, "filled"):
+            data[k] = v.filled(np.nan)
+
+    return coord.SkyCoord(**data, frame="icrs")
+
 
 def worker_agama(task):
     (
         (i, j),
         idx,
-        galcen,
         meta,
+        source_file,
         gala_potential,
-        agama_components,
-        frame,
+        galcen_frame,
         cache_file,
-        id_colname,
-        ids,
+        colnames,
+        rng,
     ) = task
-    ids = ids[idx]
-    galcen = galcen[idx]
 
-    agama_pot = agama.Potential(*agama_components)
+    if len(meta["xyz"]["shape"]) > 2:
+        N_error_samples = meta["xyz"]["shape"][1] - 1
+    else:
+        N_error_samples = 0
 
-    w0 = gd.PhaseSpacePosition(galcen.cartesian)
-    H = gp.Hamiltonian(gala_potential, frame)
-    static_frame = gp.StaticFrame(H.units)
+    # Convert potential from Gala to Agama
+    agama_pot = gala_potential.as_interop("agama")
+
+    # Load source data file:
+    g = GaiaData(at.QTable.read(source_file))[idx]
+
+    H = gp.Hamiltonian(gala_potential)
 
     logger.debug(f"Worker {i}-{j}: running {j-i} tasks now")
 
-    # Set up data containers:
+    # Set up data containers for this worker:
     all_data = {}
     for k, info in meta.items():
-        if k == id_colname:
-            all_data[k] = ids
-        else:
-            shape = (len(ids),) + info["shape"][1:]
-            all_data[k] = np.full(shape, np.nan)
+        shape = (len(idx),) + info["shape"][1:]
+        all_data[k] = np.full(shape, -1).astype(info.get("dtype", "f8"))
 
     act_finder = agama.ActionFinder(agama_pot)
-    for n in range(len(galcen)):
-        all_data[id_colname][n] = ids[n]
-        all_data["xyz"][n] = galcen.data.xyz[:, n].to_value(meta["xyz"]["unit"])
-        all_data["vxyz"][n] = galcen.velocity.d_xyz[:, n].to_value(meta["vxyz"]["unit"])
+    for n, i in enumerate(np.sort(idx)):
+        all_data[colnames["id"]][n] = getattr(g, colnames["id"])[n]
+
+        c_n = get_c_error_samples(
+            g[n], N_error_samples=N_error_samples, colnames=colnames, rng=rng
+        )
+
+        # Returned objects have shape (1, 1 + N_error_samples) - the 0th element values
+        # along axis 1 are the catalog values and all other values are error samples
+        galcen = c_n.transform_to(galcen_frame)
+        w0 = gd.PhaseSpacePosition(galcen.cartesian)
+
+        xv = np.squeeze(w0.w(gala_potential.units))
+        bad_mean = np.any(~np.isfinite(xv.T.flat[:6]))
+        if bad_mean:
+            logger.error(
+                f"Failed to compute xyz, vxyz for catalog value for source {i}"
+            )
+            all_data["flags"][n] += 2**0
+            continue
+
+        all_data["xyz"][n] = galcen.data.xyz.to_value(meta["xyz"]["unit"]).T
+        all_data["vxyz"][n] = galcen.velocity.d_xyz.to_value(meta["vxyz"]["unit"]).T
         all_data["flags"][n] = 0
 
-        xv = np.squeeze(w0[n].w(gala_potential.units))
         try:
-            act, ang, freq = act_finder(xv, angles=True)
+            act, ang, freq = act_finder(xv.T, angles=True)
         except Exception as e:
             logger.error(f"Failed to compute actions {i}\n{str(e)}")
             all_data["flags"][n] += 2**1
@@ -80,17 +178,17 @@ def worker_agama(task):
         freq = freq / u.Myr
         ang = ang * u.rad
 
-        # Note: 4 is a magic number
-        T = 4 * np.max(np.abs(2 * np.pi / freq).to(u.Gyr))
+        # Note: 4 is a magic number, so is 32 Gyr
+        T = min(4 * np.max(np.abs(2 * np.pi / freq).to(u.Gyr)), 32 * u.Gyr)
         try:
             orbit = H.integrate_orbit(
-                w0[n],
+                w0,
                 dt=0.5 * u.Myr,
                 t1=0 * u.Myr,
                 t2=T,
                 Integrator=gi.DOPRI853Integrator,
             )
-            orbit = orbit.to_frame(static_frame)
+            # orbit = orbit.to_frame(static_frame)
         except Exception as e:
             logger.error(f"Failed to integrate orbit {i+n}\n{str(e)}")
             all_data["flags"][n] += 2**2
@@ -98,9 +196,9 @@ def worker_agama(task):
 
         # Compute actions / frequencies / angles
         reorder = [0, 2, 1]
-        all_data["actions"][n] = act[reorder].to_value(meta["actions"]["unit"])
-        all_data["angles"][n] = ang[reorder].to_value(meta["angles"]["unit"])
-        all_data["freqs"][n] = freq[reorder].to_value(
+        all_data["actions"][n] = act[..., reorder].to_value(meta["actions"]["unit"])
+        all_data["angles"][n] = ang[..., reorder].to_value(meta["angles"]["unit"])
+        all_data["freqs"][n] = freq[..., reorder].to_value(
             meta["freqs"]["unit"], u.dimensionless_angles()
         )
 
@@ -108,7 +206,7 @@ def worker_agama(task):
         try:
             all_data["L"][n] = np.mean(
                 orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
-            )
+            ).T
             all_data["E"][n] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
         except Exception as e:
             logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
@@ -156,6 +254,7 @@ def main(
     rv_err_colname=None,
     galcen_filename=None,
     N_error_samples=0,
+    seed=None,
 ):
     logger.debug(f"Starting file {source_file}...")
 
@@ -164,48 +263,15 @@ def main(
     cache_path.mkdir(exist_ok=True)
 
     source_file = pathlib.Path(source_file).resolve()
+    if not source_file.exists():
+        raise IOError(f"Source data file {source_file} does not exist")
 
     # Global parameters
-
-    gala_pot = gp.MilkyWayPotential2022()
+    gala_potential = gp.MilkyWayPotential2022()
     potential_name = "MilkyWayPotential2022"
-    act_name = "agama"
-
-    # Convert to Agama potential:
-    agama_components = []
-    for p in gala_pot["disk"].get_three_potentials().values():
-        agama_components.append(
-            dict(
-                type="miyamotonagai",
-                mass=p.parameters["m"].value,
-                scaleradius=p.parameters["a"].value,
-                scaleheight=p.parameters["b"].value,
-            )
-        )
-
-    for k in ["bulge", "nucleus"]:
-        p = gala_pot[k]
-        agama_components.append(
-            dict(
-                type="dehnen",
-                mass=p.parameters["m"].value,
-                scaleradius=p.parameters["c"].value,
-                gamma=1.0,
-            )
-        )
-
-    p = gala_pot["halo"]
-    agama_components.append(
-        dict(
-            type="nfw",
-            mass=p.parameters["m"].value,
-            scaleradius=p.parameters["r_s"].value,
-        )
-    )
-
-    H = gp.Hamiltonian(gala_pot)
 
     if galcen_filename is None:
+        # See: Hunt, Price-Whelan et al. 2022
         galcen_frame = coord.Galactocentric(
             galcen_distance=8.275 * u.kpc, galcen_v_sun=[8.4, 251.8, 8.4] * u.km / u.s
         )
@@ -213,7 +279,7 @@ def main(
         with open(galcen_filename, "rb") as f:
             galcen_frame = pickle.load(f)
 
-    source_name = source_file.name.split(".")[0]
+    source_name, source_ext, *_ = source_file.name.split(".")
     cache_file = cache_path / f"{source_name}-{potential_name}-{act_name}.hdf5"
     logger.debug(f"Writing to cache file {cache_file}".format(cache_file))
 
@@ -223,79 +289,68 @@ def main(
     with open(galcen_cache_file, "wb") as f:
         pickle.dump(galcen_frame, f)
 
-    # Load the source data table:
-    g = GaiaData(at.QTable.read(source_file))
-
-    mask = np.ones(len(g), dtype=bool)
     if id_colname is None:  # assumes gaia
         id_colname = "source_id"
-        ids = g.source_id.astype("i8")
-    else:
-        ids = g.data[id_colname]
 
     if dist_colname is None:  # assumes gaia
-        dist = coord.Distance(parallax=g.parallax, allow_negative=True)
-        mask &= np.isfinite(dist)
-    else:
-        dist = g.data[dist_colname]
-    mask &= dist > 0
+        dist_colname = "parallax"
 
     if rv_colname is None:  # assumes gaia
-        if hasattr(g, "radial_velocity"):
-            rv = g.radial_velocity
-        elif hasattr(g, "dr2_radial_velocity"):
-            rv = g.dr2_radial_velocity
-        else:
-            raise ValueError("Invalid radial velocity column or dataset")
-        mask &= np.isfinite(rv)
+        rv_colname = "radial_velocity"
+        rv_err_colname = "radial_velocity_error"
+
+    # Column names for things that may have been provided by other surveys:
+    colnames = {
+        "id": id_colname,
+        "rv": rv_colname,
+        "rv_err": rv_err_colname,
+        "dist": dist_colname,
+        "dist_err": dist_err_colname,
+    }
+
+    # Count the number of sources in the source data table:
+    if source_ext.lower() == "fits":
+        # We don't actually have to load the data - we can use the header
+        hdr = fits.getheader(source_file, ext=1)
+        Nstars = hdr["NAXIS2"]
+        for k, v in hdr.items():
+            if k.startswith("TTYPE"):
+                if v.strip() == id_colname:
+                    tform = hdr[f"TFORM{k[5:]}"].strip()
+        id_dtype = FITS2NUMPY[tform]
     else:
-        rv = g.data[rv_colname]
-
-    if not hasattr(dist, "unit") or dist.unit == u.one or dist.unit is None:
-        logger.warning("No distance unit specified in table - assuming kpc")
-        dist = dist * u.kpc
-
-    if not hasattr(rv, "unit") or rv.unit == u.one or rv.unit is None:
-        logger.warning("No RV unit specified in table - assuming km/s")
-        rv = rv * u.km / u.s
-
-    # Get coordinates, and only keep good values:
-    if ~np.all(mask):
-        logger.warning(f"Filtering {len(mask) - mask.sum()} bad distance or RV values")
-
-    if hasattr(dist, "filled"):
-        dist = dist.filled(np.nan)
-    if hasattr(rv, "filled"):
-        rv = rv.filled(np.nan)
-    c = g.get_skycoord(distance=u.Quantity(dist), radial_velocity=u.Quantity(rv))
-
-    galcen = c.transform_to(galcen_frame)
-    logger.debug("Data loaded...")
-
-    Nstars = len(c)
+        tbl = at.Table.read(source_file)
+        Nstars = len(tbl)
+        id_dtype = tbl[id_colname].dtype
+        del tbl
 
     # Column metadata: map names to shapes
+    if N_error_samples > 0:
+        base_shape = (Nstars, 1 + N_error_samples)
+    else:
+        base_shape = (Nstars,)
+
     meta = {
         id_colname: {
             "shape": (Nstars,),
-            "dtype": g.data[id_colname].dtype,
+            "dtype": id_dtype,
             "fillvalue": None,
         },
-        "xyz": {"shape": (Nstars, 3), "unit": u.kpc},
-        "vxyz": {"shape": (Nstars, 3), "unit": u.km / u.s},
+        "xyz": {"shape": base_shape + (3,), "unit": u.kpc},
+        "vxyz": {"shape": base_shape + (3,), "unit": u.km / u.s},
         # Frequencies, actions, and angles:
-        "freqs": {"shape": (Nstars, 3), "unit": u.rad / u.Gyr},
-        "actions": {"shape": (Nstars, 3), "unit": u.kpc * u.km / u.s},
-        "angles": {"shape": (Nstars, 3), "unit": u.rad},
+        "freqs": {"shape": base_shape + (3,), "unit": u.rad / u.Gyr},
+        "actions": {"shape": base_shape + (3,), "unit": u.kpc * u.km / u.s},
+        "angles": {"shape": base_shape + (3,), "unit": u.rad},
         # Orbit parameters:
-        "R_guide": {"shape": (Nstars,), "unit": u.kpc},
-        "z_max": {"shape": (Nstars,), "unit": u.kpc},
-        "r_per": {"shape": (Nstars,), "unit": u.kpc},
-        "r_apo": {"shape": (Nstars,), "unit": u.kpc},
-        "ecc": {"shape": (Nstars,), "unit": u.one},
-        "L": {"shape": (Nstars, 3), "unit": u.kpc * u.km / u.s},
-        "E": {"shape": (Nstars,), "unit": (u.km / u.s) ** 2},
-        "flags": {"shape": (Nstars,), "dtype": "i8", "fillvalue": -1},
+        "R_guide": {"shape": base_shape, "unit": u.kpc},
+        "z_max": {"shape": base_shape, "unit": u.kpc},
+        "r_per": {"shape": base_shape, "unit": u.kpc},
+        "r_apo": {"shape": base_shape, "unit": u.kpc},
+        "ecc": {"shape": base_shape, "unit": u.one},
+        "L": {"shape": base_shape + (3,), "unit": u.kpc * u.km / u.s},
+        "E": {"shape": base_shape, "unit": (u.km / u.s) ** 2},
+        "flags": {"shape": base_shape, "dtype": "i4", "fillvalue": -1},
     }
 
     # Make sure output file exists
@@ -311,29 +366,27 @@ def main(
                 if "unit" in info:
                     d.attrs["unit"] = str(info["unit"])
 
-            f["flags"][np.where(~mask)] = 1
-
     # If path exists, see what indices are not already done
     with h5py.File(cache_file, "r") as f:
-        todo_idx = np.where((f["flags"][:] == -1) & mask)[0]
+        if len(base_shape) > 1:
+            todo_idx = np.where(np.any(f["flags"][:] == -1, axis=1))[0]
+        else:
+            todo_idx = np.where(f["flags"][:] == -1)[0]
 
-    logger.info(f"{len(todo_idx)} left to process")
+    logger.info(f"{len(todo_idx)} sources left to process")
+
+    # Random number generator:
+    parent_rng = np.random.default_rng(seed)
 
     n_batches = min(8 * max(1, pool.size - 1), len(todo_idx))
     tasks = batch_tasks(
         n_batches=n_batches,
         arr=todo_idx,
-        args=(
-            galcen,
-            meta,
-            H.potential,
-            agama_components,
-            H.frame,
-            cache_file,
-            id_colname,
-            ids,
-        ),
+        args=(meta, source_file, gala_potential, galcen_frame, cache_file, colnames),
     )
+    rngs = parent_rng.spawn(len(tasks))
+    tasks = [tuple(t) + (rng,) for t, rng in zip(tasks, rngs)]
+
     for r in pool.map(worker_agama, tasks, callback=callback):
         pass
 
@@ -383,9 +436,14 @@ if __name__ == "__main__":
     parser.add_argument("--id-col", dest="id_colname", default=None)
     parser.add_argument("--dist-col", dest="dist_colname", default=None)
     parser.add_argument("--dist-err-col", dest="dist_err_colname", default=None)
+    parser.add_argument("--rv-col", dest="rv_colname", default=None)
     parser.add_argument("--rv-err-col", dest="rv_err_colname", default=None)
 
-    parser.add_argument("--n-error-samples", dest="N_error_samples", default=0)
+    parser.add_argument(
+        "--n-error-samples", dest="N_error_samples", default=0, type=int
+    )
+
+    parser.add_argument("--seed", dest="seed", default=None, type=int)
 
     parser.add_argument("-g", "--galcen", dest="galcen_filename", default=None)
 
@@ -428,4 +486,5 @@ if __name__ == "__main__":
                 rv_err_colname=args.rv_err_colname,
                 galcen_filename=args.galcen_filename,
                 N_error_samples=args.N_error_samples,
+                seed=args.seed,
             )
