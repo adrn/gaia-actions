@@ -225,7 +225,9 @@ def worker_agama(task):
             L[:, good_xv_mask] = np.mean(
                 orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
             )
-            E[good_xv_mask] = np.mean(orbit.energy().to_value(meta["E"]["unit"]))
+            E[good_xv_mask] = np.mean(
+                orbit.energy().to_value(meta["E"]["unit"]), axis=0
+            )
         except Exception as e:
             logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
             all_data["flags"][n] += 2**4
@@ -269,6 +271,7 @@ def callback(res):
 
     logger.debug(f"Writing block {idx[0]}-{idx[-1]} to cache file")
     with h5py.File(cache_file, "r+") as f:
+        f.attrs["col_order"] = list(all_data.keys())
         for k in all_data:
             f[k][idx] = all_data[k]
 
