@@ -32,87 +32,6 @@ logging.basicConfig()
 act_name = "agama"
 
 
-def get_c_error_samples(g, N_error_samples, colnames, rng):
-    """
-    Only works for one star at a time
-    """
-    C, units = g.get_cov()
-    C = C[0]  # only one star at a time
-
-    y = np.full((6, 1), np.nan)
-    y[0] = g.ra.to_value(units["ra"])
-    y[1] = g.dec.to_value(units["dec"])
-    y[3] = g.pmra.to_value(units["pmra"])
-    y[4] = g.pmdec.to_value(units["pmdec"])
-
-    if colnames["dist"] == "parallax":
-        y[2] = g.parallax.to_value(units["parallax"])
-    else:
-        dist = getattr(g, colnames["dist"])
-        y[2] = dist.value if hasattr(dist, "unit") else dist
-
-        dist_err = getattr(g, colnames["dist_err"])
-        C[:, 2] = C[2] = 0.0
-        C[2, 2] = dist_err.value**2 if hasattr(dist_err, "unit") else dist_err ** 2
-
-    if colnames["rv"] == "radial_velocity":
-        rv = g.radial_velocity
-        y[5] = rv.to_value(units["radial_velocity"])
-    else:
-        rv = getattr(g, colnames["rv"])
-        y[5] = rv.value if hasattr(rv, "unit") else rv
-
-        rv_err = getattr(g, colnames["rv_err"])
-        C[:, 5] = C[5] = 0.0
-        C[5, 5] = rv_err.value**2 if hasattr(rv_err, "unit") else rv_err ** 2
-
-    y = y[:, 0]
-    if N_error_samples > 0:
-        try:
-            samples = rng.multivariate_normal(y, C, size=N_error_samples)
-        except np.linalg.LinAlgError:
-            logger.error(
-                f"Failed to sample from error distribution for source {g.source_id}"
-            )
-            samples = np.full((N_error_samples, 6), np.nan)
-        samples = np.concatenate(([y], samples)).T
-    else:
-        samples = y[:, None]
-
-    data = dict(
-        ra=samples[0] * units["ra"],
-        dec=samples[1] * units["dec"],
-        pm_ra_cosdec=samples[3] * units["pmra"],
-        pm_dec=samples[4] * units["pmdec"],
-    )
-
-    if colnames["dist"] == "parallax":
-        data["distance"] = coord.Distance(
-            parallax=samples[2] * units["parallax"], allow_negative=True
-        )
-    else:
-        if not hasattr(dist, "unit") or dist.unit == u.one or dist.unit is None:
-            logger.warning("No distance unit specified in table - assuming kpc")
-            dist_unit = u.kpc
-        else:
-            dist_unit = dist.unit
-        data["distance"] = samples[2] * dist_unit
-        data["distance"][data["distance"] < 0] = np.nan * dist_unit
-
-    if not hasattr(rv, "unit") or rv.unit == u.one or rv.unit is None:
-        logger.warning("No RV unit specified in table - assuming km/s")
-        rv_unit = u.km / u.s
-    else:
-        rv_unit = rv.unit
-    data["radial_velocity"] = samples[5] * rv_unit
-
-    for k, v in data.items():
-        if hasattr(v, "filled"):
-            data[k] = v.filled(np.nan)
-
-    return coord.SkyCoord(**data, frame="icrs")
-
-
 def worker_agama(task):
     (
         (i, j),
@@ -123,6 +42,7 @@ def worker_agama(task):
         galcen_frame,
         cache_file,
         colnames,
+        gaiadata_kw,
         rng,
     ) = task
 
@@ -135,7 +55,7 @@ def worker_agama(task):
     agama_pot = gala_potential.as_interop("agama")
 
     # Load source data file:
-    g = GaiaData(at.QTable.read(source_file))[idx]
+    g = GaiaData(at.QTable.read(source_file), **gaiadata_kw)[idx]
 
     H = gp.Hamiltonian(gala_potential)
 
@@ -151,10 +71,11 @@ def worker_agama(task):
     for n, i in enumerate(np.sort(idx)):
         all_data[colnames["id"]][n] = getattr(g, colnames["id"])[n]
 
-        # Always comes back with ndim > 0
-        c_n = get_c_error_samples(
-            g[n], N_error_samples=N_error_samples, colnames=colnames, rng=rng
-        )
+        if N_error_samples > 0:
+            g_samples = g[n].get_error_samples(size=N_error_samples, rng=rng)
+            c_n = g_samples.get_skycoord()
+        else:
+            c_n = g[n].get_skycoord()
 
         # Returned objects have shape (1, 1 + N_error_samples) - the 0th element values
         # along axis 1 are the catalog values and all other values are error samples
@@ -327,6 +248,7 @@ def main(
 
     if dist_colname is None:  # assumes gaia
         dist_colname = "parallax"
+        dist_err_colname = "parallax_error"
 
     if rv_colname is None:  # assumes gaia
         rv_colname = "radial_velocity"
@@ -339,6 +261,13 @@ def main(
         "rv_err": rv_err_colname,
         "dist": dist_colname,
         "dist_err": dist_err_colname,
+    }
+
+    gaiadata_kw = {
+        "distance_colname": dist_colname,
+        "distance_error_colname": dist_err_colname,
+        "radial_velocity_colname": rv_colname,
+        "radial_velocity_error_colname": rv_err_colname,
     }
 
     # Count the number of sources in the source data table:
@@ -416,7 +345,15 @@ def main(
     tasks = batch_tasks(
         n_batches=n_batches,
         arr=todo_idx,
-        args=(meta, source_file, gala_potential, galcen_frame, cache_file, colnames),
+        args=(
+            meta,
+            source_file,
+            gala_potential,
+            galcen_frame,
+            cache_file,
+            colnames,
+            gaiadata_kw,
+        ),
     )
     rngs = parent_rng.spawn(len(tasks))
     tasks = [tuple(t) + (rng,) for t, rng in zip(tasks, rngs)]
