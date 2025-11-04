@@ -1,3 +1,5 @@
+# TODO: look at mpipool-2025/scripts/write-on-main-process.py
+
 # Standard library
 import os
 
@@ -25,7 +27,7 @@ from astropy.io.fits.column import FITS2NUMPY
 from pyia import GaiaData
 from schwimmbad.utils import batch_tasks
 
-agama.setUnits(mass=u.Msun, length=u.kpc, time=u.Myr)
+agama.setUnits(mass=1.0, length=1.0, time=1.0)  # Msun, kpc, Myr
 logger = logging.getLogger(__name__)
 logging.basicConfig()
 
@@ -59,7 +61,7 @@ def worker_agama(task):
 
     H = gp.Hamiltonian(gala_potential)
 
-    logger.debug(f"Worker {i}-{j}: running {j-i} tasks now")
+    logger.debug(f"Worker {i}-{j}: running {j - i} tasks now")
 
     # Set up data containers for this worker:
     all_data = {}
@@ -86,13 +88,13 @@ def worker_agama(task):
         bad_mean = np.any(~np.isfinite(xv[0]))
         good_xv_mask = np.all(np.isfinite(xv), axis=1)
         if bad_mean:
-            logger.error(
+            logger.warning(
                 f"Failed to compute xyz, vxyz for catalog value for source {i}"
             )
             all_data["flags"][n] += 2**0
             continue
         if not np.any(good_xv_mask):
-            logger.error(f"All xyz, vxyz for error samples are bad values {i}")
+            logger.warning(f"All xyz, vxyz for error samples are bad values {i}")
             all_data["flags"][n] += 2**0
             continue
 
@@ -103,7 +105,7 @@ def worker_agama(task):
         try:
             act, ang, freq = act_finder(xv, angles=True)
         except Exception as e:
-            logger.error(f"Failed to compute actions {i}\n{str(e)}")
+            logger.warning(f"Failed to compute actions {i}\n{str(e)}")
             all_data["flags"][n] += 2**1
             continue
 
@@ -127,7 +129,7 @@ def worker_agama(task):
                 orbit = orbit[:, None]
             # orbit = orbit.to_frame(static_frame)
         except Exception as e:
-            logger.error(f"Failed to integrate orbit {i+n}\n{str(e)}")
+            logger.warning(f"Failed to integrate orbit {i + n}\n{str(e)}")
             all_data["flags"][n] += 2**2
             continue
 
@@ -150,7 +152,7 @@ def worker_agama(task):
                 orbit.energy().to_value(meta["E"]["unit"]), axis=0
             )
         except Exception as e:
-            logger.error(f"Failed to compute E Lz for orbit {i+n}\n{e}")
+            logger.warning(f"Failed to compute E Lz for orbit {i + n}\n{e}")
             all_data["flags"][n] += 2**4
         all_data["L"][n] = np.squeeze(L.T)
         all_data["E"][n] = np.squeeze(E)
@@ -161,8 +163,8 @@ def worker_agama(task):
         rapo = np.full((len(c_n),), np.nan)
         ecc = np.full((len(c_n),), np.nan)
         try:
-            all_data["R_guide"][n] = w0.guiding_radius(gala_potential).to_value(
-                meta["R_guide"]["unit"]
+            all_data["R_guide"][n] = np.squeeze(
+                w0.guiding_radius(gala_potential).to_value(meta["R_guide"]["unit"])
             )
 
             zmax[good_xv_mask] = orbit.zmax(approximate=True).to_value(
@@ -176,7 +178,7 @@ def worker_agama(task):
             )
             ecc = (rapo - rper) / (rapo + rper)
         except Exception as e:
-            logger.error(f"Failed to compute zmax peri apo for orbit {i+n}\n{e}")
+            logger.warning(f"Failed to compute zmax peri apo for orbit {i + n}\n{e}")
             all_data["flags"][n] += 2**3
 
         all_data["z_max"][n] = np.squeeze(zmax)
@@ -246,13 +248,15 @@ def main(
     if id_colname is None:  # assumes gaia
         id_colname = "source_id"
 
-    if dist_colname is None:  # assumes gaia
-        dist_colname = "parallax"
-        dist_err_colname = "parallax_error"
+    dist_colname = "parallax" if dist_colname is None else dist_colname
+    dist_err_colname = (
+        "parallax_error" if dist_err_colname is None else dist_err_colname
+    )
 
-    if rv_colname is None:  # assumes gaia
-        rv_colname = "radial_velocity"
-        rv_err_colname = "radial_velocity_error"
+    rv_colname = "radial_velocity" if rv_colname is None else rv_colname
+    rv_err_colname = (
+        "radial_velocity_error" if rv_err_colname is None else rv_err_colname
+    )
 
     # Column names for things that may have been provided by other surveys:
     colnames = {
@@ -378,7 +382,7 @@ if __name__ == "__main__":
         dest="n_procs",
         default=1,
         type=int,
-        help="Number of processes (uses " "multiprocessing).",
+        help="Number of processes (uses multiprocessing).",
     )
     group.add_argument(
         "--mpi",
