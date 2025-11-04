@@ -1,15 +1,7 @@
-# TODO: look at mpipool-2025/scripts/write-on-main-process.py
-
-# Standard library
-import os
-
-os.environ["OMP_NUM_THREADS"] = "1"
+import json
 import logging
 import pathlib
-import pickle
-import sys
 
-# Third-party
 from astropy.utils import iers
 
 iers.conf.auto_download = False
@@ -25,31 +17,24 @@ import numpy as np
 from astropy.io import fits
 from astropy.io.fits.column import FITS2NUMPY
 from pyia import GaiaData
-from schwimmbad.utils import batch_tasks
 
 agama.setUnits(mass=1.0, length=1.0, time=1.0)  # Msun, kpc, Myr
 logger = logging.getLogger(__name__)
 logging.basicConfig()
 
-act_name = "agama"
 
-
-def worker_agama(task):
-    (
-        (i, j),
-        idx,
-        meta,
-        source_file,
-        gala_potential,
-        galcen_frame,
-        cache_file,
-        colnames,
-        gaiadata_kw,
-        rng,
-    ) = task
-
-    if len(meta["xyz"]["shape"]) > 2:
-        N_error_samples = meta["xyz"]["shape"][1] - 1
+def batch_worker(
+    source_data_idx,
+    data_model,
+    source_file,
+    gala_potential,
+    galcen_frame,
+    cache_file,
+    colnames,
+    rng,
+):
+    if len(data_model["xyz"]["shape"]) > 2:
+        N_error_samples = data_model["xyz"]["shape"][1] - 1
     else:
         N_error_samples = 0
 
@@ -57,21 +42,30 @@ def worker_agama(task):
     agama_pot = gala_potential.as_interop("agama")
 
     # Load source data file:
-    g = GaiaData(at.QTable.read(source_file), **gaiadata_kw)[idx]
+    gaiadata_kw = {
+        "distance_colname": colnames["dist"],
+        "distance_error_colname": colnames["dist_err"],
+        "radial_velocity_colname": colnames["rv"],
+        "radial_velocity_error_colname": colnames["rv_err"],
+    }
+    g = GaiaData(at.QTable.read(source_file), **gaiadata_kw)[source_data_idx]
 
     H = gp.Hamiltonian(gala_potential)
 
-    logger.debug(f"Worker {i}-{j}: running {j - i} tasks now")
+    logger.debug(f"Worker running {len(source_data_idx)} tasks now")
 
     # Set up data containers for this worker:
-    all_data = {}
-    for k, info in meta.items():
-        shape = (len(idx),) + info["shape"][1:]
-        all_data[k] = np.full(shape, -1).astype(info.get("dtype", "f8"))
+    batch_data = {}
+    for k, info in data_model.items():
+        shape = (len(source_data_idx),) + info["shape"][1:]
+        fill_val = info.get("fillvalue", np.nan)
+        batch_data[k] = np.full(shape, fill_val if fill_val is not None else -1).astype(
+            info.get("dtype", "f8")
+        )
 
     act_finder = agama.ActionFinder(agama_pot)
-    for n, i in enumerate(np.sort(idx)):
-        all_data[colnames["id"]][n] = getattr(g, colnames["id"])[n]
+    for n, i in enumerate(np.sort(source_data_idx)):
+        batch_data[colnames["id"]][n] = getattr(g, colnames["id"])[n]
 
         if N_error_samples > 0:
             g_samples = g[n].get_error_samples(size=N_error_samples, rng=rng)
@@ -88,25 +82,27 @@ def worker_agama(task):
         bad_mean = np.any(~np.isfinite(xv[0]))
         good_xv_mask = np.all(np.isfinite(xv), axis=1)
         if bad_mean:
-            logger.warning(
+            logger.debug(
                 f"Failed to compute xyz, vxyz for catalog value for source {i}"
             )
-            all_data["flags"][n] += 2**0
+            batch_data["flags"][n] += 2**0
             continue
         if not np.any(good_xv_mask):
-            logger.warning(f"All xyz, vxyz for error samples are bad values {i}")
-            all_data["flags"][n] += 2**0
+            logger.debug(f"All xyz, vxyz for error samples are bad values {i}")
+            batch_data["flags"][n] += 2**0
             continue
 
-        all_data["xyz"][n] = galcen.data.xyz.to_value(meta["xyz"]["unit"]).T
-        all_data["vxyz"][n] = galcen.velocity.d_xyz.to_value(meta["vxyz"]["unit"]).T
-        all_data["flags"][n] = 0
+        batch_data["xyz"][n] = galcen.data.xyz.to_value(data_model["xyz"]["unit"]).T
+        batch_data["vxyz"][n] = galcen.velocity.d_xyz.to_value(
+            data_model["vxyz"]["unit"]
+        ).T
+        batch_data["flags"][n] = 0
 
         try:
             act, ang, freq = act_finder(xv, angles=True)
         except Exception as e:
-            logger.warning(f"Failed to compute actions {i}\n{str(e)}")
-            all_data["flags"][n] += 2**1
+            logger.debug(f"Failed to compute actions {i}\n{str(e)}")
+            batch_data["flags"][n] += 2**1
             continue
 
         act = act * u.kpc**2 / u.Myr
@@ -123,22 +119,26 @@ def worker_agama(task):
                 dt=0.5 * u.Myr,
                 t1=0 * u.Myr,
                 t2=T,
-                Integrator=gi.DOPRI853Integrator,
+                Integrator=gi.LeapfrogIntegrator,
             )
             if len(orbit.shape) < 2:
                 orbit = orbit[:, None]
             # orbit = orbit.to_frame(static_frame)
         except Exception as e:
-            logger.warning(f"Failed to integrate orbit {i + n}\n{str(e)}")
-            all_data["flags"][n] += 2**2
+            logger.debug(f"Failed to integrate orbit {i + n}\n{str(e)}")
+            batch_data["flags"][n] += 2**2
             continue
 
         # Compute actions / frequencies / angles
         reorder = [0, 2, 1]
-        all_data["actions"][n] = act[..., reorder].to_value(meta["actions"]["unit"])
-        all_data["angles"][n] = ang[..., reorder].to_value(meta["angles"]["unit"])
-        all_data["freqs"][n] = freq[..., reorder].to_value(
-            meta["freqs"]["unit"], u.dimensionless_angles()
+        batch_data["actions"][n] = act[..., reorder].to_value(
+            data_model["actions"]["unit"]
+        )
+        batch_data["angles"][n] = ang[..., reorder].to_value(
+            data_model["angles"]["unit"]
+        )
+        batch_data["freqs"][n] = freq[..., reorder].to_value(
+            data_model["freqs"]["unit"], u.dimensionless_angles()
         )
 
         # L and E
@@ -146,16 +146,16 @@ def worker_agama(task):
         E = np.full((len(c_n),), np.nan)
         try:
             L[:, good_xv_mask] = np.mean(
-                orbit.angular_momentum().to_value(meta["L"]["unit"]), axis=1
+                orbit.angular_momentum().to_value(data_model["L"]["unit"]), axis=1
             )
             E[good_xv_mask] = np.mean(
-                orbit.energy().to_value(meta["E"]["unit"]), axis=0
+                orbit.energy().to_value(data_model["E"]["unit"]), axis=0
             )
         except Exception as e:
-            logger.warning(f"Failed to compute E Lz for orbit {i + n}\n{e}")
-            all_data["flags"][n] += 2**4
-        all_data["L"][n] = np.squeeze(L.T)
-        all_data["E"][n] = np.squeeze(E)
+            logger.debug(f"Failed to compute E Lz for orbit {i + n}\n{e}")
+            batch_data["flags"][n] += 2**4
+        batch_data["L"][n] = np.squeeze(L.T)
+        batch_data["E"][n] = np.squeeze(E)
 
         # Other various things:
         zmax = np.full((len(c_n),), np.nan)
@@ -163,44 +163,45 @@ def worker_agama(task):
         rapo = np.full((len(c_n),), np.nan)
         ecc = np.full((len(c_n),), np.nan)
         try:
-            all_data["R_guide"][n] = np.squeeze(
-                w0.guiding_radius(gala_potential).to_value(meta["R_guide"]["unit"])
+            batch_data["R_guide"][n] = np.squeeze(
+                w0.guiding_radius(gala_potential).to_value(
+                    data_model["R_guide"]["unit"]
+                )
             )
 
             zmax[good_xv_mask] = orbit.zmax(approximate=True).to_value(
-                meta["z_max"]["unit"]
+                data_model["z_max"]["unit"]
             )
             rper[good_xv_mask] = orbit.pericenter(approximate=True).to_value(
-                meta["r_per"]["unit"]
+                data_model["r_per"]["unit"]
             )
             rapo[good_xv_mask] = orbit.apocenter(approximate=True).to_value(
-                meta["r_apo"]["unit"]
+                data_model["r_apo"]["unit"]
             )
             ecc = (rapo - rper) / (rapo + rper)
         except Exception as e:
-            logger.warning(f"Failed to compute zmax peri apo for orbit {i + n}\n{e}")
-            all_data["flags"][n] += 2**3
+            logger.debug(f"Failed to compute zmax peri apo for orbit {i + n}\n{e}")
+            batch_data["flags"][n] += 2**3
 
-        all_data["z_max"][n] = np.squeeze(zmax)
-        all_data["r_per"][n] = np.squeeze(rper)
-        all_data["r_apo"][n] = np.squeeze(rapo)
-        all_data["ecc"][n] = np.squeeze(ecc)
+        batch_data["z_max"][n] = np.squeeze(zmax)
+        batch_data["r_per"][n] = np.squeeze(rper)
+        batch_data["r_apo"][n] = np.squeeze(rapo)
+        batch_data["ecc"][n] = np.squeeze(ecc)
 
-    return idx, cache_file, all_data
-
-
-def callback(res):
-    idx, cache_file, all_data = res
-
-    logger.debug(f"Writing block {idx[0]}-{idx[-1]} to cache file")
-    with h5py.File(cache_file, "r+") as f:
-        f.attrs["col_order"] = list(all_data.keys())
-        for k in all_data:
-            f[k][idx] = all_data[k]
+    return {"data": batch_data, "cache_file": cache_file, "idx": source_data_idx}
 
 
-def main(
-    pool,
+def batch_callback(future):
+    result = future.result()
+
+    logger.debug(f"Writing block {result['idx'][0]}-{result['idx'][-1]} to cache file")
+    with h5py.File(result["cache_file"], "r+") as f:
+        f.attrs["col_order"] = list(result["data"].keys())
+        for k in result["data"]:
+            f[k][result["idx"]] = result["data"][k]
+
+
+def prepare_data_and_cache(
     source_file,
     overwrite=False,
     id_colname=None,
@@ -208,11 +209,9 @@ def main(
     dist_err_colname=None,
     rv_colname=None,
     rv_err_colname=None,
-    galcen_filename=None,
     N_error_samples=0,
-    seed=None,
 ):
-    logger.debug(f"Starting file {source_file}...")
+    logger.debug(f"Starting file {source_file!s}...")
 
     cache_path = pathlib.Path(__file__).parent / "../cache"
     cache_path = cache_path.resolve()
@@ -220,32 +219,13 @@ def main(
 
     source_file = pathlib.Path(source_file).resolve()
     if not source_file.exists():
-        raise IOError(f"Source data file {source_file} does not exist")
-
-    # Global parameters
-    gala_potential = gp.MilkyWayPotential2022()
-    potential_name = "MilkyWayPotential2022"
-
-    if galcen_filename is None:
-        # See: Hunt, Price-Whelan et al. 2022
-        galcen_frame = coord.Galactocentric(
-            galcen_distance=8.275 * u.kpc, galcen_v_sun=[8.4, 251.8, 8.4] * u.km / u.s
-        )
-    else:
-        with open(galcen_filename, "rb") as f:
-            galcen_frame = pickle.load(f)
+        raise IOError(f"Source data file {source_file!s} does not exist")
 
     source_name, source_ext, *_ = source_file.name.split(".")
-    cache_file = cache_path / f"{source_name}-{potential_name}-{act_name}.hdf5"
-    logger.debug(f"Writing to cache file {cache_file}".format(cache_file))
+    cache_file = cache_path / f"{source_name}-actions.hdf5"
+    logger.debug(f"Writing to cache file {cache_file!s}")
 
-    galcen_cache_file = (
-        cache_path / f"{source_name}-{potential_name}-{act_name}.galcen.pkl"
-    )
-    with open(galcen_cache_file, "wb") as f:
-        pickle.dump(galcen_frame, f)
-
-    if id_colname is None:  # assumes gaia
+    if id_colname is None:  # NOTE: assumes gaia
         id_colname = "source_id"
 
     dist_colname = "parallax" if dist_colname is None else dist_colname
@@ -267,13 +247,6 @@ def main(
         "dist_err": dist_err_colname,
     }
 
-    gaiadata_kw = {
-        "distance_colname": dist_colname,
-        "distance_error_colname": dist_err_colname,
-        "radial_velocity_colname": rv_colname,
-        "radial_velocity_error_colname": rv_err_colname,
-    }
-
     # Count the number of sources in the source data table:
     if source_ext.lower() == "fits":
         # We don't actually have to load the data - we can use the header
@@ -284,6 +257,7 @@ def main(
                 if v.strip() == id_colname:
                     tform = hdr[f"TFORM{k[5:]}"].strip()
         id_dtype = FITS2NUMPY[tform]
+
     else:
         tbl = at.Table.read(source_file)
         Nstars = len(tbl)
@@ -296,7 +270,7 @@ def main(
     else:
         base_shape = (Nstars,)
 
-    meta = {
+    data_model = {
         id_colname: {
             "shape": (Nstars,),
             "dtype": id_dtype,
@@ -318,11 +292,12 @@ def main(
         "E": {"shape": base_shape, "unit": (u.km / u.s) ** 2},
         "flags": {"shape": base_shape, "dtype": "i4", "fillvalue": -1},
     }
+    logger.debug(f"Data model: {data_model!s}")
 
     # Make sure output file exists
     if not cache_file.exists() or overwrite:
         with h5py.File(cache_file, "w") as f:
-            for name, info in meta.items():
+            for name, info in data_model.items():
                 d = f.create_dataset(
                     name,
                     shape=info["shape"],
@@ -331,6 +306,7 @@ def main(
                 )
                 if "unit" in info:
                     d.attrs["unit"] = str(info["unit"])
+    logger.debug(f"Cache file created at {cache_file!s}")
 
     # If path exists, see what indices are not already done
     with h5py.File(cache_file, "r") as f:
@@ -342,31 +318,67 @@ def main(
 
     logger.info(f"{len(todo_idx)} sources left to process")
 
-    # Random number generator:
+    return {
+        "source_file": source_file,
+        "cache_file": cache_file,
+        "todo_idx": todo_idx,
+        "data_model": data_model,
+        "colnames": colnames,
+    }
+
+
+def run_batches(
+    source_file,
+    cache_file,
+    todo_idx,
+    data_model,
+    colnames,
+    seed=None,
+    pool=None,
+):
+    # TODO: allow user to customize these?
+    gala_potential = gp.MilkyWayPotential(version="v2")
+    galcen_frame = coord.Galactocentric(
+        galcen_distance=8.275 * u.kpc, galcen_v_sun=[8.4, 251.8, 8.4] * u.km / u.s
+    )
+
+    with h5py.File(cache_file, "r+") as f:
+        f.attrs["source_file"] = str(source_file)
+        f.attrs["action_method"] = "agama.ActionFinder"
+        f.attrs["gala_potential"] = json.dumps(gp.io.to_dict(gala_potential))
+        f.attrs["galcen_distance_kpc"] = galcen_frame.galcen_distance.to_value(u.kpc)
+        f.attrs["galcen_v_sun_kms"] = galcen_frame.galcen_v_sun.d_xyz.to_value(
+            u.km / u.s
+        )
+
     parent_rng = np.random.default_rng(seed)
 
-    n_batches = min(8 * max(1, pool.size - 1), len(todo_idx))
-    tasks = batch_tasks(
-        n_batches=n_batches,
-        arr=todo_idx,
-        args=(
-            meta,
-            source_file,
-            gala_potential,
-            galcen_frame,
-            cache_file,
-            colnames,
-            gaiadata_kw,
-        ),
-    )
-    rngs = parent_rng.spawn(len(tasks))
-    tasks = [tuple(t) + (rng,) for t, rng in zip(tasks, rngs)]
+    pool_size = 1 if pool is None else pool.num_workers
 
-    for r in pool.map(worker_agama, tasks, callback=callback):
-        pass
+    batch_size = max(len(todo_idx) // pool_size, 1)
+    n_batches = int(np.ceil(len(todo_idx) / batch_size))
+    rngs = parent_rng.spawn(n_batches)
 
-    pool.close()
-    sys.exit(0)
+    for i in range(n_batches):
+        logger.debug(
+            f"Submitting batch {i} of {n_batches - 1} with {batch_size} sources"
+        )
+        source_data_idx = todo_idx[i * batch_size : (i + 1) * batch_size]
+        if len(source_data_idx) == 0:
+            break
+
+        result = pool.submit(
+            batch_worker,
+            source_data_idx,
+            data_model=data_model,
+            source_file=source_file,
+            gala_potential=gala_potential,
+            galcen_frame=galcen_frame,
+            cache_file=cache_file,
+            colnames=colnames,
+            rng=rngs[i],
+        )
+        result.add_done_callback(batch_callback)
 
 
 if __name__ == "__main__":
@@ -376,15 +388,7 @@ if __name__ == "__main__":
 
     parser = ArgumentParser(description="")
 
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--nprocs",
-        dest="n_procs",
-        default=1,
-        type=int,
-        help="Number of processes (uses multiprocessing).",
-    )
-    group.add_argument(
+    parser.add_argument(
         "--mpi",
         dest="mpi",
         default=False,
@@ -408,19 +412,20 @@ if __name__ == "__main__":
         help="Verbose mode.",
     )
 
+    # Data column names:
     parser.add_argument("--id-col", dest="id_colname", default=None)
     parser.add_argument("--dist-col", dest="dist_colname", default=None)
     parser.add_argument("--dist-err-col", dest="dist_err_colname", default=None)
     parser.add_argument("--rv-col", dest="rv_colname", default=None)
     parser.add_argument("--rv-err-col", dest="rv_err_colname", default=None)
 
+    # Controls whether to generate error samples:
     parser.add_argument(
         "--n-error-samples", dest="N_error_samples", default=0, type=int
     )
 
+    # Random number seed:
     parser.add_argument("--seed", dest="seed", default=None, type=int)
-
-    parser.add_argument("-g", "--galcen", dest="galcen_filename", default=None)
 
     args = parser.parse_args()
 
@@ -429,37 +434,38 @@ if __name__ == "__main__":
     else:
         logger.setLevel(logging.INFO)
 
-    # deal with multiproc:
     if args.mpi:
-        from schwimmbad.mpi import MPIPool
+        from mpi4py import MPI
+        from mpi4py.futures import MPIPoolExecutor
 
-        Pool = MPIPool
-        kw = dict()
-    elif args.n_procs > 1:
-        from schwimmbad import MultiPool
+        logger.info(f"Running with MPI: with {MPI.COMM_WORLD.Get_size()} workers ")
 
-        Pool = MultiPool
-        kw = dict(processes=args.n_procs)
+        config = prepare_data_and_cache(
+            args.source_file,
+            overwrite=args.overwrite,
+            id_colname=args.id_colname,
+            dist_colname=args.dist_colname,
+            dist_err_colname=args.dist_err_colname,
+            rv_colname=args.rv_colname,
+            rv_err_colname=args.rv_err_colname,
+            N_error_samples=args.N_error_samples,
+        )
+
+        with threadpool_limits(limits=1, user_api="blas"):
+            with MPIPoolExecutor() as pool:
+                run_batches(**config, seed=args.seed, pool=pool)
+
     else:
-        from schwimmbad import SerialPool
+        logger.info("Running in serial mode")
+        config = prepare_data_and_cache(
+            args.source_file,
+            overwrite=args.overwrite,
+            id_colname=args.id_colname,
+            dist_colname=args.dist_colname,
+            dist_err_colname=args.dist_err_colname,
+            rv_colname=args.rv_colname,
+            rv_err_colname=args.rv_err_colname,
+            N_error_samples=args.N_error_samples,
+        )
 
-        Pool = SerialPool
-        kw = dict()
-    Pool = Pool
-    Pool_kwargs = kw
-
-    with threadpool_limits(limits=1, user_api="blas"):
-        with Pool(**Pool_kwargs) as pool:
-            main(
-                pool,
-                args.source_file,
-                overwrite=args.overwrite,
-                id_colname=args.id_colname,
-                dist_colname=args.dist_colname,
-                dist_err_colname=args.dist_err_colname,
-                rv_colname=args.rv_colname,
-                rv_err_colname=args.rv_err_colname,
-                galcen_filename=args.galcen_filename,
-                N_error_samples=args.N_error_samples,
-                seed=args.seed,
-            )
+        run_batches(**config, seed=args.seed)
