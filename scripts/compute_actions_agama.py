@@ -69,7 +69,17 @@ def batch_worker(
 
         if N_error_samples > 0:
             g_samples = g[n].get_error_samples(size=N_error_samples, rng=rng)
+
+            # TODO: workaround because distance errors can be big and lead to negative
+            # distance values that aren't being handled, for some reason, in
+            # get_distance()
+            _dist = getattr(g_samples, g_samples.distance_colname)
+            _dist[_dist < 0] = np.nan
+            setattr(g_samples, g_samples.distance_colname, _dist)
+
+            c_mean = g[n].get_skycoord()
             c_n = g_samples.get_skycoord()
+            c_n = coord.concatenate((c_mean, c_n[0]))
         else:
             c_n = g[n].get_skycoord()
 
@@ -192,7 +202,10 @@ def batch_worker(
 
 
 def batch_callback(future):
-    result = future.result()
+    if hasattr(future, "result"):
+        result = future.result()
+    else:
+        result = future
 
     logger.debug(f"Writing block {result['idx'][0]}-{result['idx'][-1]} to cache file")
     with h5py.File(result["cache_file"], "r+") as f:
@@ -367,18 +380,31 @@ def run_batches(
         if len(source_data_idx) == 0:
             break
 
-        result = pool.submit(
-            batch_worker,
-            source_data_idx,
-            data_model=data_model,
-            source_file=source_file,
-            gala_potential=gala_potential,
-            galcen_frame=galcen_frame,
-            cache_file=cache_file,
-            colnames=colnames,
-            rng=rngs[i],
-        )
-        result.add_done_callback(batch_callback)
+        if pool is not None:
+            result = pool.submit(
+                batch_worker,
+                source_data_idx,
+                data_model=data_model,
+                source_file=source_file,
+                gala_potential=gala_potential,
+                galcen_frame=galcen_frame,
+                cache_file=cache_file,
+                colnames=colnames,
+                rng=rngs[i],
+            )
+            result.add_done_callback(batch_callback)
+        else:
+            result = batch_worker(
+                source_data_idx,
+                data_model=data_model,
+                source_file=source_file,
+                gala_potential=gala_potential,
+                galcen_frame=galcen_frame,
+                cache_file=cache_file,
+                colnames=colnames,
+                rng=rngs[i],
+            )
+            batch_callback(result)
 
 
 if __name__ == "__main__":
