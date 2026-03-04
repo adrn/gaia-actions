@@ -29,7 +29,8 @@ def batch_worker(
     source_file,
     gala_potential,
     galcen_frame,
-    cache_file,
+    catalog_cache_file,
+    samples_cache_file,
     colnames,
     rng,
 ):
@@ -37,6 +38,8 @@ def batch_worker(
         N_error_samples = data_model["xyz"]["shape"][1] - 1
     else:
         N_error_samples = 0
+
+    source_data_idx = np.sort(source_data_idx)
 
     # Convert potential from Gala to Agama
     agama_pot = gala_potential.as_interop("agama")
@@ -64,7 +67,7 @@ def batch_worker(
         )
 
     act_finder = agama.ActionFinder(agama_pot)
-    for n, i in enumerate(np.sort(source_data_idx)):
+    for n, i in enumerate(source_data_idx):
         batch_data[colnames["id"]][n] = getattr(g, colnames["id"])[n]
 
         if N_error_samples > 0:
@@ -95,11 +98,11 @@ def batch_worker(
             logger.debug(
                 f"Failed to compute xyz, vxyz for catalog value for source {i}"
             )
-            batch_data["flags"][n] += 2**0
+            batch_data["flags"][n] = 2**0
             continue
         if not np.any(good_xv_mask):
             logger.debug(f"All xyz, vxyz for error samples are bad values {i}")
-            batch_data["flags"][n] += 2**0
+            batch_data["flags"][n] = 2**0
             continue
 
         batch_data["xyz"][n] = galcen.data.xyz.to_value(data_model["xyz"]["unit"]).T
@@ -112,7 +115,7 @@ def batch_worker(
             act, ang, freq = act_finder(xv, angles=True)
         except Exception as e:
             logger.debug(f"Failed to compute actions {i}\n{str(e)}")
-            batch_data["flags"][n] += 2**1
+            batch_data["flags"][n] = 2**1
             continue
 
         act = act * u.kpc**2 / u.Myr
@@ -136,7 +139,7 @@ def batch_worker(
             # orbit = orbit.to_frame(static_frame)
         except Exception as e:
             logger.debug(f"Failed to integrate orbit {i + n}\n{str(e)}")
-            batch_data["flags"][n] += 2**2
+            batch_data["flags"][n] = 2**2
             continue
 
         # Compute actions / frequencies / angles
@@ -163,7 +166,7 @@ def batch_worker(
             )
         except Exception as e:
             logger.debug(f"Failed to compute E Lz for orbit {i + n}\n{e}")
-            batch_data["flags"][n] += 2**4
+            batch_data["flags"][n] = 2**4
         batch_data["L"][n] = np.squeeze(L.T)
         batch_data["E"][n] = np.squeeze(E)
 
@@ -198,7 +201,12 @@ def batch_worker(
         batch_data["r_apo"][n] = np.squeeze(rapo)
         batch_data["ecc"][n] = np.squeeze(ecc)
 
-    return {"data": batch_data, "cache_file": cache_file, "idx": source_data_idx}
+    return {
+        "data": batch_data,
+        "catalog_cache_file": catalog_cache_file,
+        "samples_cache_file": samples_cache_file,
+        "idx": source_data_idx,
+    }
 
 
 def batch_callback(future):
@@ -207,11 +215,34 @@ def batch_callback(future):
     else:
         result = future
 
-    logger.debug(f"Writing block {result['idx'][0]}-{result['idx'][-1]} to cache file")
-    with h5py.File(result["cache_file"], "r+") as f:
-        f.attrs["col_order"] = list(result["data"].keys())
-        for k in result["data"]:
-            f[k][result["idx"]] = result["data"][k]
+    idx = result["idx"]
+    data = result["data"]
+    col_order = list(data.keys())
+    has_samples = result["samples_cache_file"] is not None
+
+    logger.debug(f"Writing block {idx[0]}-{idx[-1]} to cache file(s)")
+
+    # Write catalog values
+    with h5py.File(result["catalog_cache_file"], "r+") as f:
+        f.attrs["col_order"] = col_order
+        for k in data:
+            if has_samples and data[k].ndim >= 2:
+                # Take catalog value (index 0 along sample axis)
+                f[k][idx] = data[k][:, 0]
+            else:
+                f[k][idx] = data[k]
+
+    # Write error samples
+    if has_samples:
+        with h5py.File(result["samples_cache_file"], "r+") as f:
+            f.attrs["col_order"] = col_order
+            for k in data:
+                if data[k].ndim >= 2:
+                    # Take error samples (indices 1: along sample axis)
+                    f[k][idx] = data[k][:, 1:]
+                else:
+                    # Scalar columns (e.g. id) — same in both files
+                    f[k][idx] = data[k]
 
 
 def prepare_data_and_cache(
@@ -235,8 +266,6 @@ def prepare_data_and_cache(
         raise IOError(f"Source data file {source_file!s} does not exist")
 
     source_name, source_ext, *_ = source_file.name.split(".")
-    cache_file = cache_path / f"{source_name}-actions.hdf5"
-    logger.debug(f"Writing to cache file {cache_file!s}")
 
     if id_colname is None:  # NOTE: assumes gaia
         id_colname = "source_id"
@@ -278,39 +307,62 @@ def prepare_data_and_cache(
         del tbl
 
     # Column metadata: map names to shapes
+    # The internal data model used by batch_worker always includes the sample
+    # dimension when N_error_samples > 0 (catalog value + samples together).
+    # Two separate output files are created: one for catalog values (scalar per
+    # star) and one for error samples (array-valued per star).
     if N_error_samples > 0:
-        base_shape = (Nstars, 1 + N_error_samples)
+        internal_base_shape = (Nstars, 1 + N_error_samples)
+        catalog_base_shape = (Nstars,)
+        samples_base_shape = (Nstars, N_error_samples)
     else:
-        base_shape = (Nstars,)
+        internal_base_shape = (Nstars,)
+        catalog_base_shape = (Nstars,)
+        samples_base_shape = None
 
-    data_model = {
-        id_colname: {
-            "shape": (Nstars,),
-            "dtype": id_dtype,
-            "fillvalue": None,
-        },
-        "xyz": {"shape": base_shape + (3,), "unit": u.kpc},
-        "vxyz": {"shape": base_shape + (3,), "unit": u.km / u.s},
-        # Frequencies, actions, and angles:
-        "freqs": {"shape": base_shape + (3,), "unit": u.rad / u.Gyr},
-        "actions": {"shape": base_shape + (3,), "unit": u.kpc * u.km / u.s},
-        "angles": {"shape": base_shape + (3,), "unit": u.rad},
-        # Orbit parameters:
-        "R_guide": {"shape": base_shape, "unit": u.kpc},
-        "z_max": {"shape": base_shape, "unit": u.kpc},
-        "r_per": {"shape": base_shape, "unit": u.kpc},
-        "r_apo": {"shape": base_shape, "unit": u.kpc},
-        "ecc": {"shape": base_shape, "unit": u.one},
-        "L": {"shape": base_shape + (3,), "unit": u.kpc * u.km / u.s},
-        "E": {"shape": base_shape, "unit": (u.km / u.s) ** 2},
-        "flags": {"shape": base_shape, "dtype": "i4", "fillvalue": -1},
-    }
+    def _make_data_model(base_shape):
+        return {
+            id_colname: {
+                "shape": (Nstars,),
+                "dtype": id_dtype,
+                "fillvalue": None,
+            },
+            "xyz": {"shape": base_shape + (3,), "unit": u.kpc},
+            "vxyz": {"shape": base_shape + (3,), "unit": u.km / u.s},
+            # Frequencies, actions, and angles:
+            "freqs": {"shape": base_shape + (3,), "unit": u.rad / u.Gyr},
+            "actions": {"shape": base_shape + (3,), "unit": u.kpc * u.km / u.s},
+            "angles": {"shape": base_shape + (3,), "unit": u.rad},
+            # Orbit parameters:
+            "R_guide": {"shape": base_shape, "unit": u.kpc},
+            "z_max": {"shape": base_shape, "unit": u.kpc},
+            "r_per": {"shape": base_shape, "unit": u.kpc},
+            "r_apo": {"shape": base_shape, "unit": u.kpc},
+            "ecc": {"shape": base_shape, "unit": u.one},
+            "L": {"shape": base_shape + (3,), "unit": u.kpc * u.km / u.s},
+            "E": {"shape": base_shape, "unit": (u.km / u.s) ** 2},
+            "flags": {"shape": base_shape, "dtype": "i4", "fillvalue": -1},
+        }
+
+    # Internal model used by batch_worker (combined catalog + samples)
+    data_model = _make_data_model(internal_base_shape)
     logger.debug(f"Data model: {data_model!s}")
 
-    # Make sure output file exists
-    if not cache_file.exists() or overwrite:
-        with h5py.File(cache_file, "w") as f:
-            for name, info in data_model.items():
+    # Catalog output file
+    catalog_cache_file = cache_path / f"{source_name}-actions.hdf5"
+    catalog_data_model = _make_data_model(catalog_base_shape)
+
+    # Samples output file (only when error samples are requested)
+    if N_error_samples > 0:
+        samples_cache_file = cache_path / f"{source_name}-actions-err.hdf5"
+        samples_data_model = _make_data_model(samples_base_shape)
+    else:
+        samples_cache_file = None
+        samples_data_model = None
+
+    def _init_cache_file(path, model):
+        with h5py.File(path, "w") as f:
+            for name, info in model.items():
                 d = f.create_dataset(
                     name,
                     shape=info["shape"],
@@ -319,21 +371,28 @@ def prepare_data_and_cache(
                 )
                 if "unit" in info:
                     d.attrs["unit"] = str(info["unit"])
-    logger.debug(f"Cache file created at {cache_file!s}")
+
+    # Make sure output files exist
+    if not catalog_cache_file.exists() or overwrite:
+        _init_cache_file(catalog_cache_file, catalog_data_model)
+    logger.debug(f"Catalog cache file at {catalog_cache_file!s}")
+
+    if samples_cache_file is not None:
+        if not samples_cache_file.exists() or overwrite:
+            _init_cache_file(samples_cache_file, samples_data_model)
+        logger.debug(f"Samples cache file at {samples_cache_file!s}")
 
     # If path exists, see what indices are not already done
-    with h5py.File(cache_file, "r") as f:
+    with h5py.File(catalog_cache_file, "r") as f:
         flags = f["flags"][:]
-        if flags.ndim > 1:
-            todo_idx = np.where(np.any(flags == -1, axis=1))[0]
-        else:
-            todo_idx = np.where(flags == -1)[0]
+        todo_idx = np.where(flags == -1)[0]
 
     logger.info(f"{len(todo_idx)} sources left to process")
 
     return {
         "source_file": source_file,
-        "cache_file": cache_file,
+        "catalog_cache_file": catalog_cache_file,
+        "samples_cache_file": samples_cache_file,
         "todo_idx": todo_idx,
         "data_model": data_model,
         "colnames": colnames,
@@ -342,7 +401,8 @@ def prepare_data_and_cache(
 
 def run_batches(
     source_file,
-    cache_file,
+    catalog_cache_file,
+    samples_cache_file,
     todo_idx,
     data_model,
     colnames,
@@ -355,14 +415,20 @@ def run_batches(
         galcen_distance=8.275 * u.kpc, galcen_v_sun=[8.4, 251.8, 8.4] * u.km / u.s
     )
 
-    with h5py.File(cache_file, "r+") as f:
-        f.attrs["source_file"] = str(source_file)
-        f.attrs["action_method"] = "agama.ActionFinder"
-        f.attrs["gala_potential"] = json.dumps(gp.io.to_dict(gala_potential))
-        f.attrs["galcen_distance_kpc"] = galcen_frame.galcen_distance.to_value(u.kpc)
-        f.attrs["galcen_v_sun_kms"] = galcen_frame.galcen_v_sun.d_xyz.to_value(
-            u.km / u.s
-        )
+    # Write metadata to both output files
+    meta_attrs = {
+        "source_file": str(source_file),
+        "action_method": "agama.ActionFinder",
+        "gala_potential": json.dumps(gp.io.to_dict(gala_potential)),
+        "galcen_distance_kpc": galcen_frame.galcen_distance.to_value(u.kpc),
+        "galcen_v_sun_kms": galcen_frame.galcen_v_sun.d_xyz.to_value(u.km / u.s),
+    }
+    for cache_file in [catalog_cache_file, samples_cache_file]:
+        if cache_file is None:
+            continue
+        with h5py.File(cache_file, "r+") as f:
+            for attr_k, attr_v in meta_attrs.items():
+                f.attrs[attr_k] = attr_v
 
     parent_rng = np.random.default_rng(seed)
 
@@ -380,29 +446,28 @@ def run_batches(
         if len(source_data_idx) == 0:
             break
 
+        worker_kw = dict(
+            data_model=data_model,
+            source_file=source_file,
+            gala_potential=gala_potential,
+            galcen_frame=galcen_frame,
+            catalog_cache_file=catalog_cache_file,
+            samples_cache_file=samples_cache_file,
+            colnames=colnames,
+            rng=rngs[i],
+        )
+
         if pool is not None:
             result = pool.submit(
                 batch_worker,
                 source_data_idx,
-                data_model=data_model,
-                source_file=source_file,
-                gala_potential=gala_potential,
-                galcen_frame=galcen_frame,
-                cache_file=cache_file,
-                colnames=colnames,
-                rng=rngs[i],
+                **worker_kw,
             )
             result.add_done_callback(batch_callback)
         else:
             result = batch_worker(
                 source_data_idx,
-                data_model=data_model,
-                source_file=source_file,
-                gala_potential=gala_potential,
-                galcen_frame=galcen_frame,
-                cache_file=cache_file,
-                colnames=colnames,
-                rng=rngs[i],
+                **worker_kw,
             )
             batch_callback(result)
 
